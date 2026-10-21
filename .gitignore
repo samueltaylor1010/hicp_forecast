@@ -218,4 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+<<<<<<< Updated upstream
 your_database.db
+=======
+
+*.db
+>>>>>>> Stashed changes
