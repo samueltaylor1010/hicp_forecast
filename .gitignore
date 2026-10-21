@@ -219,5 +219,4 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-val_plot.py
 *.db
