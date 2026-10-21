@@ -1,9 +1,11 @@
 """Fit robust STL + SARIMA models to each HICP series.
 
-Each (geo, coicop) series is decomposed with a robust STL model, outliers
-are replaced by the STL baseline, and an auto-ARIMA model is fitted to the
-scrubbed series. Results are written to three tables in the HICP database:
-fitted observations, three-month forecasts, and model metadata.
+Each (geo, coicop) series is decomposed with a robust STL model. Only
+isolated outlier runs at or below --max-outlier-run are replaced by the STL
+baseline; consecutive runs and the final --protect-last observations are
+retained. An auto-ARIMA model is then fitted to the scrubbed series. Results
+are written to three tables in the HICP database: fitted observations,
+three-month forecasts, and model metadata.
 """
 
 import argparse
@@ -36,6 +38,7 @@ CREATE TABLE {table} (
     stl_resid FLOAT,
     stl_baseline FLOAT,
     is_outlier INTEGER NOT NULL,
+    is_scrubbed INTEGER NOT NULL,
     scrubbed FLOAT,
     sarima_fitted FLOAT,
     PRIMARY KEY (time_period, geo, coicop)
@@ -120,6 +123,8 @@ class Config:
     period: int = 12
     horizon: int = 3
     min_obs: int = 36
+    max_outlier_run: int = 1
+    protect_last: int = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +158,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=36,
         help="Minimum observations required per series (default: 36).",
+    )
+    parser.add_argument(
+        "--max-outlier-run",
+        type=int,
+        default=1,
+        help="Maximum consecutive outlier months to scrub (default: 1).",
+    )
+    parser.add_argument(
+        "--protect-last",
+        type=int,
+        default=1,
+        help="Number of most recent observations never to scrub (default: 1).",
     )
     parser.add_argument(
         "--jobs",
@@ -235,6 +252,7 @@ def empty_observations() -> pd.DataFrame:
             "stl_resid",
             "stl_baseline",
             "is_outlier",
+            "is_scrubbed",
             "scrubbed",
             "sarima_fitted",
         ]
@@ -313,8 +331,14 @@ def fit_series(
             threshold = 3.0 * robust_sigma
             outliers = resid.abs() > threshold
 
+        run_id = (outliers != outliers.shift(fill_value=False)).cumsum()
+        run_length = outliers.groupby(run_id).transform("size").where(outliers, 0)
+        scrub_mask = outliers & (run_length <= config.max_outlier_run)
+        if config.protect_last > 0:
+            scrub_mask.iloc[-config.protect_last:] = False
+
         scrubbed = series.copy()
-        scrubbed[outliers] = baseline[outliers]
+        scrubbed[scrub_mask] = baseline[scrub_mask]
 
         observations = pd.DataFrame(
             {
@@ -327,6 +351,7 @@ def fit_series(
                 "stl_resid": resid.to_numpy(dtype=float),
                 "stl_baseline": baseline.to_numpy(dtype=float),
                 "is_outlier": outliers.astype(int).to_numpy(),
+                "is_scrubbed": scrub_mask.astype(int).to_numpy(),
                 "scrubbed": scrubbed.to_numpy(dtype=float),
                 "sarima_fitted": np.nan,
             }
@@ -518,10 +543,17 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    if args.max_outlier_run < 0:
+        raise SystemExit("--max-outlier-run must be non-negative")
+    if args.protect_last < 0:
+        raise SystemExit("--protect-last must be non-negative")
+
     config = Config(
         period=args.period,
         horizon=args.horizon,
         min_obs=args.min_obs,
+        max_outlier_run=args.max_outlier_run,
+        protect_last=args.protect_last,
     )
     geos = split_codes(args.geos)
     coicops = split_codes(args.coicops)
