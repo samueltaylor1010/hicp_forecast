@@ -1,4 +1,4 @@
-"""Plot historical HICP indices and a CP045 shock scenario for one country."""
+"""Plot historical HICP indices and a joint-fit shock scenario for one country."""
 
 import argparse
 from pathlib import Path
@@ -146,7 +146,7 @@ def make_plot(
             ax.text(
                 0.03,
                 0.06,
-                "no pass-through multiplier\n(excluded target)",
+                "AR-only baseline\nno pass-through multiplier",
                 transform=ax.transAxes,
                 fontsize=7.5,
                 color="#555555",
@@ -191,7 +191,7 @@ def make_plot(
             marker="o",
             linestyle="None",
             markersize=7,
-            label=f"Baseline t+3 ({target_period:%Y-%m})",
+            label=f"Conditional baseline t+3 ({target_period:%Y-%m})",
         ),
         Line2D(
             [0],
@@ -212,16 +212,25 @@ def make_plot(
         fontsize=10,
     )
     fig.suptitle(
-        f"{country}: {shock_coicop} shock scenario across HICP components",
+        f"{country}: {shock_coicop} joint-fit shock scenario across HICP components",
         fontsize=16,
         fontweight="bold",
         y=0.995,
+    )
+    fig.text(
+        0.5,
+        0.012,
+        "Baseline is conditional on realized CP045 and CP0722 for multiplier "
+        "targets; CP045 and CP0722 use AR-only baselines.",
+        ha="center",
+        fontsize=8,
+        color="#555555",
     )
     fig.subplots_adjust(
         left=0.055,
         right=0.985,
         top=0.90,
-        bottom=0.06,
+        bottom=0.08,
         hspace=0.38,
         wspace=0.24,
     )
@@ -272,7 +281,7 @@ def main() -> None:
         args.history,
     )
     output = Path(
-        args.output or f"scenario_{country}_{shock_coicop}.png"
+        args.output or f"scenario_jointfit_{country}_{shock_coicop}.png"
     )
     path = make_plot(
         baselines,

@@ -1,10 +1,11 @@
 """Forecast HICP components and estimate energy shock pass-through.
 
 The pipeline keeps the 21 euro-area member countries and the mutually
-exclusive COICOP components.  It fits a direct three-month-ahead AR model
-for every country-component series, estimates constrained-free local
-projection multipliers for CP045 and CP0722 shocks, and writes three
-human-auditable CSV files.
+exclusive COICOP components.  Each non-energy target is fitted once on
+both CP045 and CP0722 YoY shocks plus its own lags.  That single joint fit
+produces the conditional baseline and both pass-through multipliers.
+CP045 and CP0722 remain excluded as multiplier targets and receive
+AR-only baselines.
 """
 
 import argparse
@@ -158,8 +159,8 @@ def build_panel(
     return wide, yoy, origin
 
 
-def training_frame(series: pd.Series, horizon: int = HORIZON) -> pd.DataFrame:
-    """Build direct-horizon target and four contemporaneous/lagged regressors."""
+def ar_training_frame(series: pd.Series, horizon: int = HORIZON) -> pd.DataFrame:
+    """Build a direct-horizon target and four own-lag regressors."""
     return pd.DataFrame(
         {
             "target": series.shift(-horizon),
@@ -171,16 +172,33 @@ def training_frame(series: pd.Series, horizon: int = HORIZON) -> pd.DataFrame:
     ).dropna()
 
 
-def fit_baseline(
+def invert_yoy_forecast(
+    wide: pd.DataFrame,
+    geo: str,
+    coicop: str,
+    origin: pd.Timestamp,
+    yoy_forecast: float,
+) -> float:
+    """Convert a target-period YoY log forecast into an index level."""
+    target_period = origin + pd.DateOffset(months=HORIZON)
+    base_period = target_period - pd.DateOffset(months=12)
+    base_index = float(wide.loc[base_period, (geo, coicop)])
+    baseline_index = base_index * np.exp(yoy_forecast)
+    if not np.isfinite(baseline_index) or baseline_index <= 0:
+        raise ValueError(f"Invalid baseline index for {geo}/{coicop}")
+    return baseline_index
+
+
+def fit_ar_baseline(
     wide: pd.DataFrame,
     yoy: pd.DataFrame,
     geo: str,
     coicop: str,
     origin: pd.Timestamp,
 ) -> dict:
-    """Fit one direct AR model and invert its YoY forecast to an index."""
+    """Fit an AR-only baseline for an excluded energy target."""
     series = yoy[(geo, coicop)]
-    data = training_frame(series)
+    data = ar_training_frame(series)
     if len(data) < MIN_OBS:
         raise ValueError(
             f"Insufficient observations for {geo}/{coicop}: {len(data)}"
@@ -208,36 +226,33 @@ def fit_baseline(
     if not np.isfinite(yoy_forecast):
         raise ValueError(f"Non-finite forecast for {geo}/{coicop}")
 
-    target_period = origin + pd.DateOffset(months=HORIZON)
-    base_period = target_period - pd.DateOffset(months=12)
-    base_index = float(wide.loc[base_period, (geo, coicop)])
-    baseline_index = base_index * np.exp(yoy_forecast)
-
-    if not np.isfinite(baseline_index) or baseline_index <= 0:
-        raise ValueError(f"Invalid baseline index for {geo}/{coicop}")
-
     return {
         "country": geo,
         "coicop": coicop,
         "forecast_origin": origin,
-        "target_period": target_period,
-        "baseline_index_t3": baseline_index,
+        "target_period": origin + pd.DateOffset(months=HORIZON),
+        "baseline_index_t3": invert_yoy_forecast(
+            wide, geo, coicop, origin, yoy_forecast
+        ),
     }
 
 
-def fit_multiplier(
+def fit_joint_model(
+    wide: pd.DataFrame,
     yoy: pd.DataFrame,
     geo: str,
     target_coicop: str,
-    shock_variable: str,
-) -> dict:
-    """Fit one unconstrained local projection with all terms estimated jointly."""
+    origin: pd.Timestamp,
+) -> tuple[dict, list[dict]]:
+    """Fit one joint shock model and derive its baseline and both multipliers."""
     target_series = yoy[(geo, target_coicop)]
-    shock_series = yoy[(geo, shock_variable)]
+    shock_045 = yoy[(geo, "CP045")]
+    shock_0722 = yoy[(geo, "CP0722")]
     data = pd.DataFrame(
         {
             "target": target_series.shift(-HORIZON),
-            "shock": shock_series,
+            "shock_045": shock_045,
+            "shock_0722": shock_0722,
             "lag0": target_series,
             "lag1": target_series.shift(1),
             "lag2": target_series.shift(2),
@@ -247,14 +262,13 @@ def fit_multiplier(
 
     if len(data) < MIN_OBS:
         raise ValueError(
-            f"Insufficient observations for {geo}/{target_coicop} "
-            f"on {shock_variable}: {len(data)}"
+            f"Insufficient observations for {geo}/{target_coicop}: {len(data)}"
         )
 
     design = np.column_stack(
         [
             np.ones(len(data)),
-            data["shock"].to_numpy(dtype=float),
+            data[["shock_045", "shock_0722"]].to_numpy(dtype=float),
             data[["lag0", "lag1", "lag2", "lag3"]].to_numpy(dtype=float),
         ]
     )
@@ -266,50 +280,77 @@ def fit_multiplier(
     result = lsq_linear(design, target, bounds=bounds, max_iter=1000)
     if not result.success:
         raise RuntimeError(
-            f"Local projection failed for {geo}/{target_coicop} "
-            f"on {shock_variable}: {result.message}"
+            f"Joint model failed for {geo}/{target_coicop}: {result.message}"
         )
 
-    beta = float(result.x[1])
-    if not np.isfinite(beta):
-        raise ValueError(
-            f"Non-finite multiplier for {geo}/{target_coicop} "
-            f"on {shock_variable}"
-        )
+    coefficients = result.x
+    forecast_row = np.array(
+        [
+            1.0,
+            float(shock_045.loc[origin]),
+            float(shock_0722.loc[origin]),
+            *[
+                float(target_series.loc[origin - pd.DateOffset(months=offset)])
+                for offset in range(4)
+            ],
+        ]
+    )
+    yoy_forecast = float(forecast_row @ coefficients)
+    if not np.isfinite(yoy_forecast):
+        raise ValueError(f"Non-finite forecast for {geo}/{target_coicop}")
 
-    return {
+    baseline = {
         "country": geo,
-        "target_coicop": target_coicop,
-        "shock_variable": shock_variable,
-        "beta_multiplier": beta,
+        "coicop": target_coicop,
+        "forecast_origin": origin,
+        "target_period": origin + pd.DateOffset(months=HORIZON),
+        "baseline_index_t3": invert_yoy_forecast(
+            wide, geo, target_coicop, origin, yoy_forecast
+        ),
     }
+    multipliers = [
+        {
+            "country": geo,
+            "target_coicop": target_coicop,
+            "shock_variable": shock,
+            "beta_multiplier": float(coefficients[index]),
+        }
+        for index, shock in ((1, "CP045"), (2, "CP0722"))
+    ]
+
+    if not all(np.isfinite(row["beta_multiplier"]) for row in multipliers):
+        raise ValueError(f"Non-finite multiplier for {geo}/{target_coicop}")
+
+    return baseline, multipliers
 
 
-def build_baselines(
+def build_artifacts(
     wide: pd.DataFrame,
     yoy: pd.DataFrame,
     origin: pd.Timestamp,
-) -> pd.DataFrame:
-    """Build the baseline forecast table for every retained series."""
-    rows = [
-        fit_baseline(wide, yoy, geo, coicop, origin)
-        for geo in EXPECTED_GEOS
-        for coicop in RETAINED_COICOPS
-    ]
-    return pd.DataFrame(rows).sort_values(["country", "coicop"])
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit each series once and build baseline and multiplier tables."""
+    baseline_rows = []
+    multiplier_rows = []
 
+    for geo in EXPECTED_GEOS:
+        for target_coicop in TARGET_COICOPS:
+            baseline, multipliers = fit_joint_model(
+                wide, yoy, geo, target_coicop, origin
+            )
+            baseline_rows.append(baseline)
+            multiplier_rows.extend(multipliers)
 
-def build_multipliers(yoy: pd.DataFrame) -> pd.DataFrame:
-    """Build pass-through multipliers for both shocks and all target components."""
-    rows = [
-        fit_multiplier(yoy, geo, target, shock)
-        for geo in EXPECTED_GEOS
-        for shock in SHOCKS
-        for target in TARGET_COICOPS
-    ]
-    return pd.DataFrame(rows).sort_values(
+        for coicop in SHOCKS:
+            baseline_rows.append(
+                fit_ar_baseline(wide, yoy, geo, coicop, origin)
+            )
+
+    baselines = pd.DataFrame(baseline_rows).sort_values(["country", "coicop"])
+    multipliers = pd.DataFrame(multiplier_rows).sort_values(
         ["country", "target_coicop", "shock_variable"]
     )
+    return baselines, multipliers
 
 
 def build_history(wide: pd.DataFrame, origin: pd.Timestamp) -> pd.DataFrame:
@@ -420,7 +461,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run the forecasting and pass-through pipeline."""
+    """Run the joint forecasting and pass-through pipeline."""
     args = parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -436,8 +477,7 @@ def main() -> None:
         origin.date(),
     )
 
-    baselines = build_baselines(wide, yoy, origin)
-    multipliers = build_multipliers(yoy)
+    baselines, multipliers = build_artifacts(wide, yoy, origin)
     history = build_history(wide, origin)
     validate_artifacts(baselines, multipliers, history)
 
@@ -459,6 +499,11 @@ def main() -> None:
         ["country", "coicop", "date", "index_value"],
     )
 
+    logging.info(
+        "Fitted %s joint target models and %s AR energy baselines",
+        len(EXPECTED_GEOS) * len(TARGET_COICOPS),
+        len(EXPECTED_GEOS) * len(SHOCKS),
+    )
     logging.info("Wrote %s baseline rows", len(baselines))
     logging.info("Wrote %s multiplier rows", len(multipliers))
     logging.info("Wrote %s historical rows", len(history))
