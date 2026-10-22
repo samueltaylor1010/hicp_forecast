@@ -11,16 +11,19 @@ import io
 import logging
 import sqlite3
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import requests
 
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
 API_ROOT = (
     "https://ec.europa.eu/eurostat/api/dissemination/sdmx/3.0/data/"
     "dataflow/ESTAT"
 )
 ACCEPT = "application/vnd.sdmx.data+csv;version=2.0.0"
-DB_PATH = "hicp.db"
+DB_PATH = DATA_DIR / "hicp.db"
 START_YEAR = 1996
 COICOP_CODES = (
     "TOTAL",
@@ -510,14 +513,14 @@ def add_core_components(conn: sqlite3.Connection) -> int:
 
 
 def main(
-    db_path: str = DB_PATH,
+    db_path: str | Path = DB_PATH,
     start_year: int = START_YEAR,
     end_year: int | None = None,
 ) -> None:
     """Run the Eurostat HICP ETL pipeline.
 
     Args:
-        db_path (str): Destination SQLite database file.
+        db_path (str | Path): Destination SQLite database file.
         start_year (int): First calendar year to load.
         end_year (int | None): Last calendar year to load; defaults to the
             current year.
@@ -526,6 +529,8 @@ def main(
         None: This function writes the SQLite database in place.
     """
     end_year = end_year or date.today().year
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with requests.Session() as session:
         session.headers["Accept"] = ACCEPT

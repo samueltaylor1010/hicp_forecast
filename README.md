@@ -28,7 +28,22 @@ scenario index: S = baseline_index * exp(d)
 ```
 
 EA aggregates are built bottom-up using 2026 country and item weights from
-`hicp.db`. The dashboard never reads SQLite at runtime.
+`data/hicp.db`. The dashboard never reads SQLite at runtime.
+
+### Data layout
+
+The source database and model artifacts live in `data/`:
+
+```text
+data/
+├── hicp.db
+├── baselines.csv
+├── multipliers.csv
+└── historical_indices.csv
+```
+
+The generated dashboard bundle is written to `app/data/`. It stays under the
+app directory so that Shinylive can bundle the CSVs into the static site.
 
 ### Build dashboard data
 
@@ -36,8 +51,8 @@ EA aggregates are built bottom-up using 2026 country and item weights from
 python scripts/build_app_data.py
 ```
 
-This copies the forecast artifacts and extracts the additional CSV files needed
-by the app into `app/data/`:
+This reads the forecast artifacts from `data/` and extracts the additional CSV
+files needed by the app into `app/data/`:
 
 ```text
 baselines.csv
@@ -52,9 +67,13 @@ ea_component_history.csv
 
 ```bash
 pip install -r requirements-dev.txt
-make app-data
+make pipeline
 make run
 ```
+
+`make pipeline` runs the full ETL, forecast, and dashboard-data pipeline. Use
+`make app-data` only when you want to rebuild `app/data/` from the existing
+artifacts in `data/`.
 
 Then open the local URL printed by Shiny.
 
@@ -96,9 +115,16 @@ For example, the CLI's `0.10` is equivalent to a dashboard shock of `+10.517%`.
 ## Forecast pipeline
 
 ```bash
-python hicp_etl.py
-python hicp_forecast.py
+make pipeline
 ```
 
-The pipeline writes `baselines.csv`, `multipliers.csv`, and
-`historical_indices.csv` in the repository root.
+or, equivalently:
+
+```bash
+python scripts/run_pipeline.py
+```
+
+This runs `hicp_etl.py`, then `hicp_forecast.py`, then
+`scripts/build_app_data.py`. The ETL writes `data/hicp.db`, the forecast step
+writes `baselines.csv`, `multipliers.csv`, and `historical_indices.csv` to
+`data/`, and the final step rebuilds `app/data/`.

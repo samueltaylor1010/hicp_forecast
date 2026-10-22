@@ -16,10 +16,11 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_FILE = ROOT / "baselines.csv"
-MULTIPLIER_FILE = ROOT / "multipliers.csv"
-HISTORY_FILE = ROOT / "historical_indices.csv"
-DB_FILE = ROOT / "hicp.db"
+DATA_DIR = ROOT / "data"
+BASELINE_FILE = DATA_DIR / "baselines.csv"
+MULTIPLIER_FILE = DATA_DIR / "multipliers.csv"
+HISTORY_FILE = DATA_DIR / "historical_indices.csv"
+DB_FILE = DATA_DIR / "hicp.db"
 
 COUNTRY_CODES = (
     "AT",

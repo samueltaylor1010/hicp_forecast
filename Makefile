@@ -1,4 +1,7 @@
-.PHONY: app-data run export serve test
+.PHONY: pipeline app-data run export serve test
+
+pipeline:
+	python scripts/run_pipeline.py
 
 app-data:
 	python scripts/build_app_data.py

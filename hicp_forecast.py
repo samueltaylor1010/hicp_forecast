@@ -16,7 +16,9 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import lsq_linear
 
-DB_PATH = "hicp.db"
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "hicp.db"
 HORIZON = 3
 MIN_OBS = 60
 SHOCKS = ("CP045", "CP0722")
@@ -555,22 +557,32 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed database and output-directory arguments.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default=DB_PATH, help="SQLite database path.")
     parser.add_argument(
-        "--out-dir", default=".", help="Directory for CSV artifacts."
+        "--db",
+        type=Path,
+        default=DB_PATH,
+        help="SQLite database path.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=DATA_DIR,
+        help="Directory for CSV artifacts.",
     )
     return parser.parse_args()
 
 
-def main() -> None:
+def main(
+    db_path: str | Path = DB_PATH,
+    out_dir: str | Path = DATA_DIR,
+) -> None:
     """Run the joint forecasting and pass-through pipeline."""
-    args = parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    panel = load_panel(args.db)
+    panel = load_panel(db_path)
     wide, yoy, origin = build_panel(panel)
     logging.info(
         "Loaded %s countries, %s components, origin %s",
@@ -583,7 +595,7 @@ def main() -> None:
     history = build_history(wide, origin)
     validate_artifacts(baselines, multipliers, history)
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(
         baselines,
@@ -608,4 +620,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.db, args.out_dir)
