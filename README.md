@@ -122,21 +122,6 @@ Pages settings (or copy it to the Pages branch).
 make test
 ```
 
-The tests cover the scenario math, percent-to-log conversion, EA aggregation
-identities, country-specific shocks, negative shocks, all geographies, chart
-rendering, and the dashboard data bundle.
-
-The CLI `plot_scenario.py` is not part of the dashboard deliverable. It remains
-useful as a methodology oracle. Its `--shock-size` is a log-point shock on the
-origin YoY/index, so compare it to the dashboard at:
-
-```text
-dashboard percent p  <=>  CLI shock log(1 + p/100)
-CLI shock q          <=>  dashboard percent 100 * (exp(q) - 1)
-```
-
-For example, the CLI's `0.10` is equivalent to a dashboard shock of `+10.517%`.
-
 ## Forecast pipeline
 
 ```bash
