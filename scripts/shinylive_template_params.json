@@ -1,0 +1,4 @@
+{
+  "title": "HICP shock simulator",
+  "include_in_head": "<style>html,body,#root,.shinylive-container,.shinylive-container.viewer,.shinylive-viewer,iframe.app-frame{background:#080d13 !important;}.shinylive-container,.shinylive-container>div,.shinylive-container.viewer,.shinylive-viewer,iframe.app-frame{border-radius:0 !important;}.shinylive-viewer .loading-wrapper{background:#080d13 !important;color:#e6edf3;}</style>"
+}

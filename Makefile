@@ -7,7 +7,7 @@ run:
 	shiny run --reload app/app.py
 
 export: app-data
-	shinylive export app docs
+	shinylive export app docs --template-params scripts/shinylive_template_params.json
 	touch docs/.nojekyll
 
 serve:
