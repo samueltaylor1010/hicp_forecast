@@ -1,11 +1,10 @@
 """Forecast HICP components and estimate energy shock pass-through.
 
 The pipeline keeps the 21 euro-area member countries and the mutually
-exclusive COICOP components.  Each non-energy target is fitted once on
-both CP045 and CP0722 YoY shocks plus its own lags.  That single joint fit
-produces the conditional baseline and both pass-through multipliers.
-CP045 and CP0722 remain excluded as multiplier targets and receive
-AR-only baselines.
+exclusive COICOP components. Each non-energy target is fitted once on both
+CP045 and CP0722 YoY shocks plus its own lags. That single joint fit produces
+the conditional baseline and both pass-through multipliers. CP045 and CP0722
+remain excluded as multiplier targets and receive AR-only baselines.
 """
 
 import argparse
@@ -68,10 +67,68 @@ BASELINE_FILE = "baselines.csv"
 MULTIPLIER_FILE = "multipliers.csv"
 HISTORY_FILE = "historical_indices.csv"
 HISTORY_MONTHS = 36
+BASELINE_COLUMNS = [
+    "country",
+    "coicop",
+    "forecast_origin",
+    "target_period",
+    "baseline_index_t3",
+]
+MULTIPLIER_COLUMNS = [
+    "country",
+    "target_coicop",
+    "shock_variable",
+    "beta_multiplier",
+]
+HISTORY_COLUMNS = ["country", "coicop", "date", "index_value"]
+
+
+def _validate_panel(frame: pd.DataFrame) -> None:
+    """Validate the scope and monthly integrity of the loaded panel.
+
+    Args:
+        frame (pd.DataFrame): Long panel with ``time_period``, ``geo``,
+            ``coicop``, and ``hicp_index`` columns.
+
+    Raises:
+        ValueError: If the panel scope, index values, or monthly continuity
+            is invalid.
+    """
+    geos = set(frame["geo"])
+    if geos != set(EXPECTED_GEOS):
+        unexpected = sorted(geos.symmetric_difference(EXPECTED_GEOS))
+        raise ValueError(f"Unexpected geographies: {unexpected}")
+
+    coicops = set(frame["coicop"])
+    if coicops != set(RETAINED_COICOPS):
+        unexpected = sorted(coicops.symmetric_difference(RETAINED_COICOPS))
+        raise ValueError(f"Unexpected COICOP codes: {unexpected}")
+
+    if frame["hicp_index"].isna().any():
+        raise ValueError("Missing HICP index values found")
+    if (frame["hicp_index"] <= 0).any():
+        raise ValueError("HICP indices must be strictly positive")
+
+    for (geo, coicop), group in frame.groupby(["geo", "coicop"], sort=False):
+        dates = pd.DatetimeIndex(group["time_period"].sort_values())
+        expected = pd.date_range(dates.min(), dates.max(), freq="MS")
+        if not dates.equals(expected):
+            raise ValueError(f"Interior monthly gap in {geo}/{coicop}")
 
 
 def load_panel(db_path: str | Path) -> pd.DataFrame:
-    """Load and validate the eligible HICP panel from SQLite."""
+    """Load the eligible HICP panel from SQLite.
+
+    Args:
+        db_path (str | Path): Path to the SQLite database.
+
+    Returns:
+        pd.DataFrame: Sorted long panel with eligible countries and components.
+
+    Raises:
+        FileNotFoundError: If the database file does not exist.
+        ValueError: If no eligible observations are found or validation fails.
+    """
     path = Path(db_path)
     if not path.exists():
         raise FileNotFoundError(f"Database not found: {path}")
@@ -92,39 +149,46 @@ def load_panel(db_path: str | Path) -> pd.DataFrame:
     if frame.empty:
         raise ValueError("No eligible HICP observations found")
 
-    geos = set(frame["geo"])
-    if geos != set(EXPECTED_GEOS):
-        raise ValueError(
-            f"Unexpected geographies: {sorted(geos.symmetric_difference(EXPECTED_GEOS))}"
-        )
+    _validate_panel(frame)
+    return frame.sort_values(
+        ["time_period", "geo", "coicop"]
+    ).reset_index(drop=True)
 
-    coicops = set(frame["coicop"])
-    if coicops != set(RETAINED_COICOPS):
-        raise ValueError(
-            f"Unexpected COICOP codes: {sorted(coicops.symmetric_difference(RETAINED_COICOPS))}"
-        )
 
-    keys = ["time_period", "geo", "coicop"]
-    if frame.duplicated(keys).any():
-        raise ValueError("Duplicate country-component-date observations found")
-    if frame[["hicp_index"]].isna().any().any():
-        raise ValueError("Missing HICP index values found")
-    if (frame["hicp_index"] <= 0).any():
-        raise ValueError("HICP indices must be strictly positive")
+def _find_origin(wide: pd.DataFrame) -> pd.Timestamp:
+    """Find the latest month observed for every retained series.
 
-    for (geo, coicop), group in frame.groupby(["geo", "coicop"], sort=False):
-        dates = pd.DatetimeIndex(group["time_period"].sort_values())
-        expected = pd.date_range(dates.min(), dates.max(), freq="MS")
-        if not dates.equals(expected):
-            raise ValueError(f"Interior monthly gap in {geo}/{coicop}")
+    Args:
+        wide (pd.DataFrame): Wide index panel indexed by month.
 
-    return frame.sort_values(keys).reset_index(drop=True)
+    Returns:
+        pd.Timestamp: Latest month with no missing values across all series.
+
+    Raises:
+        ValueError: If no month is complete across all series.
+    """
+    complete = wide.notna().all(axis=1)
+    if not complete.any():
+        raise ValueError("No month has observations for every retained series")
+    return wide.index[complete].max()
 
 
 def build_panel(
     frame: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
-    """Pivot the panel, compute YoY log differences, and find the origin."""
+    """Pivot the panel, compute YoY log differences, and find the origin.
+
+    Args:
+        frame (pd.DataFrame): Validated long HICP panel.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]: Wide index panel,
+        YoY log differences, and the common forecast origin.
+
+    Raises:
+        ValueError: If any country-component series is empty or origin
+            history is incomplete.
+    """
     wide = frame.pivot(
         index="time_period",
         columns=["geo", "coicop"],
@@ -139,14 +203,9 @@ def build_panel(
     if wide.isna().all().any():
         missing = wide.columns[wide.isna().all()].tolist()
         raise ValueError(f"Series with no observations: {missing}")
-    if (wide.dropna() <= 0).any().any():
-        raise ValueError("HICP indices must be strictly positive")
 
     yoy = np.log(wide / wide.shift(12))
-    complete = wide.notna().all(axis=1)
-    if not complete.any():
-        raise ValueError("No month has observations for every retained series")
-    origin = wide.index[complete].max()
+    origin = _find_origin(wide)
 
     required_dates = [
         origin - pd.DateOffset(months=offset) for offset in range(4)
@@ -159,17 +218,60 @@ def build_panel(
     return wide, yoy, origin
 
 
-def ar_training_frame(series: pd.Series, horizon: int = HORIZON) -> pd.DataFrame:
-    """Build a direct-horizon target and four own-lag regressors."""
-    return pd.DataFrame(
-        {
-            "target": series.shift(-horizon),
-            "lag0": series,
-            "lag1": series.shift(1),
-            "lag2": series.shift(2),
-            "lag3": series.shift(3),
-        }
-    ).dropna()
+def _training_frame(
+    series: pd.Series,
+    shocks: dict[str, pd.Series] | None = None,
+    horizon: int = HORIZON,
+) -> pd.DataFrame:
+    """Build a direct-horizon target, optional shocks, and four own lags.
+
+    Args:
+        series (pd.Series): Target YoY series.
+        shocks (dict[str, pd.Series] | None): Optional shock series keyed by
+            COICOP code.
+        horizon (int): Direct forecast horizon in months.
+
+    Returns:
+        pd.DataFrame: Complete training rows containing ``target``, optional
+        ``shock_*`` columns, and ``lag0`` through ``lag3``.
+    """
+    data = {
+        "target": series.shift(-horizon),
+        "lag0": series,
+        "lag1": series.shift(1),
+        "lag2": series.shift(2),
+        "lag3": series.shift(3),
+    }
+    for coicop, shock in (shocks or {}).items():
+        data[f"shock_{coicop}"] = shock
+    return pd.DataFrame(data).dropna()
+
+
+def _forecast_features(
+    series: pd.Series,
+    shocks: dict[str, pd.Series],
+    origin: pd.Timestamp,
+) -> np.ndarray:
+    """Build the origin-valued predictor row for a direct forecast.
+
+    Args:
+        series (pd.Series): Target YoY series.
+        shocks (dict[str, pd.Series]): Shock series keyed by COICOP code.
+        origin (pd.Timestamp): Forecast origin.
+
+    Returns:
+        np.ndarray: Predictor row ordered as intercept, shocks, then own lags.
+    """
+    return np.array(
+        [
+            1.0,
+            *[float(shock.loc[origin]) for shock in shocks.values()],
+            *[
+                float(series.loc[origin - pd.DateOffset(months=offset)])
+                for offset in range(4)
+            ],
+        ]
+    )
 
 
 def invert_yoy_forecast(
@@ -179,54 +281,114 @@ def invert_yoy_forecast(
     origin: pd.Timestamp,
     yoy_forecast: float,
 ) -> float:
-    """Convert a target-period YoY log forecast into an index level."""
+    """Convert a target-period YoY log forecast into an index level.
+
+    Args:
+        wide (pd.DataFrame): Wide index panel.
+        geo (str): Country code.
+        coicop (str): Component code.
+        origin (pd.Timestamp): Forecast origin.
+        yoy_forecast (float): Forecasted YoY log difference at ``origin + 3``.
+
+    Returns:
+        float: Forecast index level at ``origin + 3``.
+    """
     target_period = origin + pd.DateOffset(months=HORIZON)
     base_period = target_period - pd.DateOffset(months=12)
     base_index = float(wide.loc[base_period, (geo, coicop)])
-    baseline_index = base_index * np.exp(yoy_forecast)
-    if not np.isfinite(baseline_index) or baseline_index <= 0:
-        raise ValueError(f"Invalid baseline index for {geo}/{coicop}")
-    return baseline_index
+    return base_index * np.exp(yoy_forecast)
 
 
-def fit_ar_baseline(
+def _solve_model(
+    data: pd.DataFrame,
+    shock_names: tuple[str, ...],
+) -> np.ndarray:
+    """Estimate one direct model, using the appropriate OLS solver branch.
+
+    Args:
+        data (pd.DataFrame): Training rows with target, lags, and optional
+            shock columns.
+        shock_names (tuple[str, ...]): Shock COICOP codes included in the
+            model. An empty tuple fits the AR-only baseline.
+
+    Returns:
+        np.ndarray: Estimated coefficient vector.
+
+    Raises:
+        RuntimeError: If the bounded least-squares solver fails.
+    """
+    predictor_columns = [
+        *[f"shock_{shock}" for shock in shock_names],
+        "lag0",
+        "lag1",
+        "lag2",
+        "lag3",
+    ]
+    design = np.column_stack(
+        [
+            np.ones(len(data)),
+            data[predictor_columns].to_numpy(dtype=float),
+        ]
+    )
+    target = data["target"].to_numpy(dtype=float)
+
+    if not shock_names:
+        coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
+        return coefficients
+
+    result = lsq_linear(
+        design,
+        target,
+        bounds=(
+            np.full(design.shape[1], -np.inf),
+            np.full(design.shape[1], np.inf),
+        ),
+        max_iter=1000,
+    )
+    if not result.success:
+        raise RuntimeError(f"Joint model failed: {result.message}")
+    return result.x
+
+
+def fit_direct_model(
     wide: pd.DataFrame,
     yoy: pd.DataFrame,
     geo: str,
     coicop: str,
     origin: pd.Timestamp,
-) -> dict:
-    """Fit an AR-only baseline for an excluded energy target."""
+    shock_coicops: tuple[str, ...] = (),
+) -> tuple[dict, list[dict]]:
+    """Fit one direct model and derive its baseline and multipliers.
+
+    Args:
+        wide (pd.DataFrame): Wide index panel.
+        yoy (pd.DataFrame): Wide YoY log-difference panel.
+        geo (str): Country code.
+        coicop (str): Target component code.
+        origin (pd.Timestamp): Forecast origin.
+        shock_coicops (tuple[str, ...]): Shock components to include. An
+            empty tuple fits the AR-only energy baseline.
+
+    Returns:
+        tuple[dict, list[dict]]: Baseline row and multiplier rows.
+
+    Raises:
+        ValueError: If too few complete training observations are available.
+        RuntimeError: If the shock model solver fails.
+    """
     series = yoy[(geo, coicop)]
-    data = ar_training_frame(series)
+    shocks = {shock: yoy[(geo, shock)] for shock in shock_coicops}
+    data = _training_frame(series, shocks)
     if len(data) < MIN_OBS:
         raise ValueError(
             f"Insufficient observations for {geo}/{coicop}: {len(data)}"
         )
 
-    design = np.column_stack(
-        [
-            np.ones(len(data)),
-            data[["lag0", "lag1", "lag2", "lag3"]].to_numpy(dtype=float),
-        ]
-    )
-    target = data["target"].to_numpy(dtype=float)
-    coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
-
-    forecast_row = np.array(
-        [
-            1.0,
-            *[
-                float(series.loc[origin - pd.DateOffset(months=offset)])
-                for offset in range(4)
-            ],
-        ]
-    )
+    coefficients = _solve_model(data, tuple(shock_coicops))
+    forecast_row = _forecast_features(series, shocks, origin)
     yoy_forecast = float(forecast_row @ coefficients)
-    if not np.isfinite(yoy_forecast):
-        raise ValueError(f"Non-finite forecast for {geo}/{coicop}")
 
-    return {
+    baseline = {
         "country": geo,
         "coicop": coicop,
         "forecast_origin": origin,
@@ -235,92 +397,15 @@ def fit_ar_baseline(
             wide, geo, coicop, origin, yoy_forecast
         ),
     }
-
-
-def fit_joint_model(
-    wide: pd.DataFrame,
-    yoy: pd.DataFrame,
-    geo: str,
-    target_coicop: str,
-    origin: pd.Timestamp,
-) -> tuple[dict, list[dict]]:
-    """Fit one joint shock model and derive its baseline and both multipliers."""
-    target_series = yoy[(geo, target_coicop)]
-    shock_045 = yoy[(geo, "CP045")]
-    shock_0722 = yoy[(geo, "CP0722")]
-    data = pd.DataFrame(
-        {
-            "target": target_series.shift(-HORIZON),
-            "shock_045": shock_045,
-            "shock_0722": shock_0722,
-            "lag0": target_series,
-            "lag1": target_series.shift(1),
-            "lag2": target_series.shift(2),
-            "lag3": target_series.shift(3),
-        }
-    ).dropna()
-
-    if len(data) < MIN_OBS:
-        raise ValueError(
-            f"Insufficient observations for {geo}/{target_coicop}: {len(data)}"
-        )
-
-    design = np.column_stack(
-        [
-            np.ones(len(data)),
-            data[["shock_045", "shock_0722"]].to_numpy(dtype=float),
-            data[["lag0", "lag1", "lag2", "lag3"]].to_numpy(dtype=float),
-        ]
-    )
-    target = data["target"].to_numpy(dtype=float)
-    bounds = (
-        np.full(design.shape[1], -np.inf),
-        np.full(design.shape[1], np.inf),
-    )
-    result = lsq_linear(design, target, bounds=bounds, max_iter=1000)
-    if not result.success:
-        raise RuntimeError(
-            f"Joint model failed for {geo}/{target_coicop}: {result.message}"
-        )
-
-    coefficients = result.x
-    forecast_row = np.array(
-        [
-            1.0,
-            float(shock_045.loc[origin]),
-            float(shock_0722.loc[origin]),
-            *[
-                float(target_series.loc[origin - pd.DateOffset(months=offset)])
-                for offset in range(4)
-            ],
-        ]
-    )
-    yoy_forecast = float(forecast_row @ coefficients)
-    if not np.isfinite(yoy_forecast):
-        raise ValueError(f"Non-finite forecast for {geo}/{target_coicop}")
-
-    baseline = {
-        "country": geo,
-        "coicop": target_coicop,
-        "forecast_origin": origin,
-        "target_period": origin + pd.DateOffset(months=HORIZON),
-        "baseline_index_t3": invert_yoy_forecast(
-            wide, geo, target_coicop, origin, yoy_forecast
-        ),
-    }
     multipliers = [
         {
             "country": geo,
-            "target_coicop": target_coicop,
+            "target_coicop": coicop,
             "shock_variable": shock,
             "beta_multiplier": float(coefficients[index]),
         }
-        for index, shock in ((1, "CP045"), (2, "CP0722"))
+        for index, shock in enumerate(shock_coicops, start=1)
     ]
-
-    if not all(np.isfinite(row["beta_multiplier"]) for row in multipliers):
-        raise ValueError(f"Non-finite multiplier for {geo}/{target_coicop}")
-
     return baseline, multipliers
 
 
@@ -329,22 +414,27 @@ def build_artifacts(
     yoy: pd.DataFrame,
     origin: pd.Timestamp,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fit each series once and build baseline and multiplier tables."""
+    """Fit every retained series once and build output tables.
+
+    Args:
+        wide (pd.DataFrame): Wide index panel.
+        yoy (pd.DataFrame): Wide YoY log-difference panel.
+        origin (pd.Timestamp): Forecast origin.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]: Baseline and multiplier tables.
+    """
     baseline_rows = []
     multiplier_rows = []
 
     for geo in EXPECTED_GEOS:
-        for target_coicop in TARGET_COICOPS:
-            baseline, multipliers = fit_joint_model(
-                wide, yoy, geo, target_coicop, origin
+        for coicop in RETAINED_COICOPS:
+            shocks = SHOCKS if coicop in TARGET_COICOPS else ()
+            baseline, multipliers = fit_direct_model(
+                wide, yoy, geo, coicop, origin, shocks
             )
             baseline_rows.append(baseline)
             multiplier_rows.extend(multipliers)
-
-        for coicop in SHOCKS:
-            baseline_rows.append(
-                fit_ar_baseline(wide, yoy, geo, coicop, origin)
-            )
 
     baselines = pd.DataFrame(baseline_rows).sort_values(["country", "coicop"])
     multipliers = pd.DataFrame(multiplier_rows).sort_values(
@@ -354,25 +444,28 @@ def build_artifacts(
 
 
 def build_history(wide: pd.DataFrame, origin: pd.Timestamp) -> pd.DataFrame:
-    """Return the last 36 monthly index observations for all retained series."""
+    """Return the last 36 monthly index observations for all series.
+
+    Args:
+        wide (pd.DataFrame): Wide index panel.
+        origin (pd.Timestamp): Forecast origin and end of the history window.
+
+    Returns:
+        pd.DataFrame: Long historical index table.
+    """
     start = origin - pd.DateOffset(months=HISTORY_MONTHS - 1)
-    recent = wide.loc[start:origin].copy()
-    recent.index.name = "date"
-    recent.columns = [
-        f"{geo}|{coicop}" for geo, coicop in recent.columns
-    ]
-    history = (
-        recent.reset_index()
-        .melt(id_vars="date", var_name="series", value_name="index_value")
-        .assign(
-            country=lambda frame: frame["series"].str.split("|").str[0],
-            coicop=lambda frame: frame["series"].str.split("|").str[1],
-        )
-        .drop(columns="series")
+    recent = wide.loc[start:origin].rename_axis(
+        index="date",
+        columns=["country", "coicop"],
     )
-    return history[
-        ["country", "coicop", "date", "index_value"]
-    ].sort_values(["country", "coicop", "date"])
+    history = (
+        recent.stack(["country", "coicop"], future_stack=True)
+        .rename("index_value")
+        .reset_index()
+    )
+    return history[HISTORY_COLUMNS].sort_values(
+        ["country", "coicop", "date"]
+    )
 
 
 def validate_artifacts(
@@ -380,51 +473,44 @@ def validate_artifacts(
     multipliers: pd.DataFrame,
     history: pd.DataFrame,
 ) -> None:
-    """Check shapes, keys, and values before serialization."""
-    n_countries = len(EXPECTED_GEOS)
-    n_series = len(RETAINED_COICOPS)
-    n_targets = len(TARGET_COICOPS)
+    """Check output shapes, keys, and value domains before serialization.
 
-    expected_baselines = n_countries * n_series
-    expected_multipliers = n_countries * len(SHOCKS) * n_targets
-    expected_history = n_countries * n_series * HISTORY_MONTHS
+    Args:
+        baselines (pd.DataFrame): Baseline forecast table.
+        multipliers (pd.DataFrame): Multiplier table.
+        history (pd.DataFrame): Historical index table.
 
-    if len(baselines) != expected_baselines:
-        raise ValueError(
-            f"Expected {expected_baselines} baselines, got {len(baselines)}"
-        )
-    if len(multipliers) != expected_multipliers:
-        raise ValueError(
-            f"Expected {expected_multipliers} multipliers, got {len(multipliers)}"
-        )
-    if len(history) != expected_history:
-        raise ValueError(
-            f"Expected {expected_history} historical rows, got {len(history)}"
-        )
+    Raises:
+        ValueError: If row counts, key uniqueness, or value domains are invalid.
+    """
+    expected_rows = {
+        "baselines": len(EXPECTED_GEOS) * len(RETAINED_COICOPS),
+        "multipliers": (
+            len(EXPECTED_GEOS) * len(SHOCKS) * len(TARGET_COICOPS)
+        ),
+        "history": (
+            len(EXPECTED_GEOS) * len(RETAINED_COICOPS) * HISTORY_MONTHS
+        ),
+    }
+    tables = {
+        "baselines": baselines,
+        "multipliers": multipliers,
+        "history": history,
+    }
+    for name, frame in tables.items():
+        if len(frame) != expected_rows[name]:
+            raise ValueError(
+                f"Expected {expected_rows[name]} {name} rows, got {len(frame)}"
+            )
 
-    baseline_keys = ["country", "coicop"]
-    multiplier_keys = ["country", "target_coicop", "shock_variable"]
-    history_keys = ["country", "coicop", "date"]
-
-    if baselines.duplicated(baseline_keys).any():
+    if baselines.duplicated(["country", "coicop"]).any():
         raise ValueError("Duplicate baseline keys")
-    if multipliers.duplicated(multiplier_keys).any():
+    if multipliers.duplicated(
+        ["country", "target_coicop", "shock_variable"]
+    ).any():
         raise ValueError("Duplicate multiplier keys")
-    if history.duplicated(history_keys).any():
+    if history.duplicated(["country", "coicop", "date"]).any():
         raise ValueError("Duplicate historical keys")
-
-    if set(baselines["coicop"]) != set(RETAINED_COICOPS):
-        raise ValueError("Unexpected components in baseline output")
-    if set(multipliers["shock_variable"]) != set(SHOCKS):
-        raise ValueError("Unexpected shocks in multiplier output")
-    if set(multipliers["target_coicop"]) != set(TARGET_COICOPS):
-        raise ValueError("Unexpected targets in multiplier output")
-    if baselines["country"].nunique() != n_countries:
-        raise ValueError("Unexpected countries in baseline output")
-    if "EA" in set(history["country"]):
-        raise ValueError("Aggregate geography EA found in historical output")
-    if set(history["coicop"]) & {"TOTAL", "CP04", "CP07"}:
-        raise ValueError("Aggregate components found in historical output")
 
     if not np.isfinite(baselines["baseline_index_t3"]).all():
         raise ValueError("Non-finite baseline indices")
@@ -441,7 +527,13 @@ def write_csv(
     path: Path,
     columns: list[str],
 ) -> None:
-    """Serialize a table with stable column order and date formatting."""
+    """Serialize a table with stable column order and date formatting.
+
+    Args:
+        frame (pd.DataFrame): Table to write.
+        path (Path): Destination CSV path.
+        columns (list[str]): Output column order.
+    """
     frame[columns].to_csv(
         path,
         index=False,
@@ -451,7 +543,11 @@ def write_csv(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+    """Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed database and output-directory arguments.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DB_PATH, help="SQLite database path.")
     parser.add_argument(
@@ -486,24 +582,19 @@ def main() -> None:
     write_csv(
         baselines,
         out_dir / BASELINE_FILE,
-        ["country", "coicop", "forecast_origin", "target_period", "baseline_index_t3"],
+        BASELINE_COLUMNS,
     )
     write_csv(
         multipliers,
         out_dir / MULTIPLIER_FILE,
-        ["country", "target_coicop", "shock_variable", "beta_multiplier"],
+        MULTIPLIER_COLUMNS,
     )
     write_csv(
         history,
         out_dir / HISTORY_FILE,
-        ["country", "coicop", "date", "index_value"],
+        HISTORY_COLUMNS,
     )
 
-    logging.info(
-        "Fitted %s joint target models and %s AR energy baselines",
-        len(EXPECTED_GEOS) * len(TARGET_COICOPS),
-        len(EXPECTED_GEOS) * len(SHOCKS),
-    )
     logging.info("Wrote %s baseline rows", len(baselines))
     logging.info("Wrote %s multiplier rows", len(multipliers))
     logging.info("Wrote %s historical rows", len(history))

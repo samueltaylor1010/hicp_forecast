@@ -15,7 +15,10 @@ from datetime import date
 import pandas as pd
 import requests
 
-API_ROOT = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/3.0/data/dataflow/ESTAT"
+API_ROOT = (
+    "https://ec.europa.eu/eurostat/api/dissemination/sdmx/3.0/data/"
+    "dataflow/ESTAT"
+)
 ACCEPT = "application/vnd.sdmx.data+csv;version=2.0.0"
 DB_PATH = "hicp.db"
 START_YEAR = 1996
@@ -67,6 +70,14 @@ CORE_COMPONENTS = {
     "CP04_CORE": ("CP04", "CP045"),
     "CP07_CORE": ("CP07", "CP0722"),
 }
+PANEL_COLUMNS = [
+    "time_period",
+    "geo",
+    "coicop",
+    "hicp_index",
+    "item_weight",
+    "country_weight",
+]
 
 SCHEMA = """
 CREATE TABLE hicp_panel_data (
@@ -93,16 +104,18 @@ def fetch_csv(
     """Fetch one SDMX CSV time slice as a DataFrame.
 
     Args:
-        session: Requests session carrying the required Accept header.
-        dataset: Eurostat dataflow identifier (for example ``PRC_HICP_MINR``).
-        key: Dot-separated SDMX series key (for example ``M.I25.*.*``).
-        start: Inclusive lower period bound, ``YYYY`` or ``YYYY-MM``.
-        end: Inclusive upper period bound, ``YYYY`` or ``YYYY-MM``.
-        coicop_filter: Optional comma-separated COICOP codes to request.
-        geo_filter: Optional comma-separated geography codes to request.
+        session (requests.Session): Requests session carrying the required
+            Accept header.
+        dataset (str): Eurostat dataflow identifier, for example
+            ``PRC_HICP_MINR``.
+        key (str): Dot-separated SDMX series key, for example ``M.I25.*.*``.
+        start (str): Inclusive lower period bound, ``YYYY`` or ``YYYY-MM``.
+        end (str): Inclusive upper period bound, ``YYYY`` or ``YYYY-MM``.
+        coicop_filter (str | None): Optional comma-separated COICOP codes.
+        geo_filter (str | None): Optional comma-separated geography codes.
 
     Returns:
-        Parsed CSV payload.
+        pd.DataFrame: Parsed CSV payload.
 
     Raises:
         RuntimeError: If Eurostat returns a non-CSV payload.
@@ -134,21 +147,49 @@ def fetch_csv(
         low_memory=False,
     )
 
-# TODO break some of the workings into sub-function(s) for readability maybe?
-def load_year(
-    conn: sqlite3.Connection,
-    session: requests.Session,
-    year: int,
-) -> int:
-    """Extract, transform, and load one year of HICP observations.
+
+def _validate_codes(
+    frame: pd.DataFrame,
+    name: str,
+    column: str,
+    allowed: tuple[str, ...],
+) -> None:
+    """Validate that a frame contains only expected code values.
 
     Args:
-        conn: SQLite connection with the target table already created.
-        session: Requests session carrying the required Accept header.
-        year: Calendar year to process.
+        frame (pd.DataFrame): Frame to validate.
+        name (str): Human-readable frame name used in error messages.
+        column (str): Column containing the codes.
+        allowed (tuple[str, ...]): Permitted code values.
+
+    Raises:
+        RuntimeError: If unexpected codes are present.
+    """
+    unexpected = set(frame[column]) - set(allowed)
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected {column} values in {name}: {sorted(unexpected)}"
+        )
+
+
+def _fetch_year_data(
+    session: requests.Session,
+    year: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fetch the monthly indices, item weights, and country weights for a year.
+
+    Args:
+        session (requests.Session): Requests session carrying the required
+            Accept header.
+        year (int): Calendar year to fetch.
 
     Returns:
-        Number of rows appended to ``hicp_panel_data``.
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: Monthly, item-weight,
+        and country-weight frames.
+
+    Raises:
+        RuntimeError: If Eurostat returns an unexpected payload.
+        requests.HTTPError: If a request fails.
     """
     monthly = fetch_csv(
         session,
@@ -176,24 +217,34 @@ def load_year(
         str(year),
         geo_filter=GEO_FILTER,
     )
+    return monthly, items, countries
 
-    for name, frame in (("monthly", monthly), ("items", items)):
-        unexpected = set(frame["coicop18"]) - set(COICOP_CODES)
-        if unexpected:
-            raise RuntimeError(
-                f"Unexpected COICOP codes in {name}: {sorted(unexpected)}"
-            )
 
-    for name, frame in (
-        ("monthly", monthly),
-        ("items", items),
-        ("countries", countries),
-    ):
-        unexpected = set(frame["geo"]) - set(GEO_CODES)
-        if unexpected:
-            raise RuntimeError(
-                f"Unexpected geography codes in {name}: {sorted(unexpected)}"
-            )
+def _build_year_panel(
+    monthly: pd.DataFrame,
+    items: pd.DataFrame,
+    countries: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Transform and merge one year of Eurostat frames into panel rows.
+
+    Args:
+        monthly (pd.DataFrame): Monthly HICP index payload.
+        items (pd.DataFrame): Annual item-weight payload.
+        countries (pd.DataFrame): Annual country-weight payload.
+        year (int): Calendar year being assembled.
+
+    Returns:
+        pd.DataFrame: Panel rows ready for insertion.
+
+    Raises:
+        RuntimeError: If unexpected COICOP or geography codes are present.
+    """
+    _validate_codes(monthly, "monthly", "coicop18", COICOP_CODES)
+    _validate_codes(items, "items", "coicop18", COICOP_CODES)
+    _validate_codes(monthly, "monthly", "geo", GEO_CODES)
+    _validate_codes(items, "items", "geo", GEO_CODES)
+    _validate_codes(countries, "countries", "geo", GEO_CODES)
 
     monthly["year"] = monthly["TIME_PERIOD"].str[:4].astype(int)
     monthly["time_period"] = monthly["TIME_PERIOD"] + "-01"
@@ -202,7 +253,9 @@ def load_year(
     )
 
     items["year"] = year
-    items = items.rename(columns={"coicop18": "coicop", "OBS_VALUE": "item_weight"})
+    items = items.rename(
+        columns={"coicop18": "coicop", "OBS_VALUE": "item_weight"}
+    )
 
     countries["year"] = year
     countries = countries.rename(columns={"OBS_VALUE": "country_weight"})
@@ -218,17 +271,32 @@ def load_year(
         how="left",
         validate="many_to_one",
     )
+    return panel[PANEL_COLUMNS]
 
-    panel = panel[
-        [
-            "time_period",
-            "geo",
-            "coicop",
-            "hicp_index",
-            "item_weight",
-            "country_weight",
-        ]
-    ]
+
+def load_year(
+    conn: sqlite3.Connection,
+    session: requests.Session,
+    year: int,
+) -> int:
+    """Extract, transform, and load one year of HICP observations.
+
+    Args:
+        conn (sqlite3.Connection): SQLite connection with the target table
+            already created.
+        session (requests.Session): Requests session carrying the required
+            Accept header.
+        year (int): Calendar year to process.
+
+    Returns:
+        int: Number of rows appended to ``hicp_panel_data``.
+
+    Raises:
+        RuntimeError: If Eurostat returns unexpected codes or payloads.
+        requests.HTTPError: If a request fails.
+    """
+    monthly, items, countries = _fetch_year_data(session, year)
+    panel = _build_year_panel(monthly, items, countries, year)
     panel.to_sql(
         "hicp_panel_data",
         conn,
@@ -240,38 +308,20 @@ def load_year(
     return len(panel)
 
 
-# TODO re-review this function
-def core_index_series(
+def _prepare_core_data(
     frame: pd.DataFrame,
-    core: str,
     parent: str,
     sub: str,
 ) -> pd.DataFrame:
-    """Build a normalized chain-linked core index for one geography.
-
-    The parent index is decomposed into ``sub`` and a residual ``core``
-    using annual item weights and December link levels:
-
-        I_core = L_core * (
-            w_parent / w_core * I_parent / L_parent
-            - w_sub / w_core * I_sub / L_sub
-        )
-
-    The first available month is used as the initial link when the prior
-    December is unavailable. The result is rescaled so its 2025 average
-    is 100.
+    """Join parent and subcomponent rows for one geography.
 
     Args:
-        frame: HICP rows for one geography containing ``parent`` and ``sub``.
-        core: Derived COICOP code to assign to the result.
-        parent: Parent COICOP code, for example ``CP04``.
-        sub: Subcomponent COICOP code to remove, for example ``CP045``.
+        frame (pd.DataFrame): HICP rows for one geography.
+        parent (str): Parent COICOP code.
+        sub (str): Subcomponent COICOP code to subtract.
 
     Returns:
-        Rows for the derived component with the target table columns.
-
-    Raises:
-        RuntimeError: If the result cannot be normalized to its 2025 base.
+        pd.DataFrame: Joined and filtered parent/subcomponent observations.
     """
     parent_rows = frame[frame["coicop"] == parent].set_index("time_period")
     sub_rows = frame[frame["coicop"] == sub].set_index("time_period")
@@ -295,49 +345,110 @@ def core_index_series(
     )
     data = data[data["item_weight_parent"] > data["item_weight_sub"]]
     data.index = data.index.astype(str)
-    data = data.sort_index()
-    if data.empty:
-        return pd.DataFrame(
-            columns=[
-                "time_period",
-                "geo",
-                "coicop",
-                "hicp_index",
-                "item_weight",
-                "country_weight",
-            ]
-        )
+    return data.sort_index()
 
-    values = {}
-    for year in sorted(data.index.str[:4].unique()):
-        year_rows = data[data.index.str[:4] == year]
+
+def _link_core_series(data: pd.DataFrame) -> pd.Series:
+    """Chain-link a residual core index from prepared parent/sub data.
+
+    Args:
+        data (pd.DataFrame): Output of :func:`_prepare_core_data`.
+
+    Returns:
+        pd.Series: Unnormalized linked core index indexed by period.
+    """
+    linked = pd.Series(dtype=float)
+    for year, year_rows in data.groupby(data.index.str[:4], sort=True):
         prior_december = f"{int(year) - 1}-12-01"
-        if prior_december in data.index and prior_december in values:
+        if prior_december in linked.index:
             link_period = prior_december
-            core_link = values[link_period]
+            core_link = float(linked.loc[link_period])
         else:
             link_period = year_rows.index[0]
-            core_link = year_rows.loc[link_period, "hicp_index_parent"]
+            core_link = float(
+                year_rows.loc[link_period, "hicp_index_parent"]
+            )
 
-        parent_link = data.loc[link_period, "hicp_index_parent"]
-        sub_link = data.loc[link_period, "hicp_index_sub"]
-        parent_weight = year_rows.iloc[0]["item_weight_parent"]
-        sub_weight = year_rows.iloc[0]["item_weight_sub"]
+        parent_link = float(data.loc[link_period, "hicp_index_parent"])
+        sub_link = float(data.loc[link_period, "hicp_index_sub"])
+        parent_weight = float(year_rows.iloc[0]["item_weight_parent"])
+        sub_weight = float(year_rows.iloc[0]["item_weight_sub"])
         core_weight = parent_weight - sub_weight
 
-        for period, row in year_rows.iterrows():
-            values[period] = core_link * (
-                parent_weight * (row["hicp_index_parent"] / parent_link)
-                - sub_weight * (row["hicp_index_sub"] / sub_link)
-            ) / core_weight
+        values = core_link * (
+            parent_weight * (year_rows["hicp_index_parent"] / parent_link)
+            - sub_weight * (year_rows["hicp_index_sub"] / sub_link)
+        ) / core_weight
+        linked = pd.concat([linked, values])
 
-    core_series = pd.Series(values).sort_index()
-    base = core_series[core_series.index.str.startswith("2025")].mean()
+    return linked.sort_index()
+
+
+def _normalize_core_series(
+    series: pd.Series,
+    core: str,
+    geo: str,
+) -> pd.Series:
+    """Normalize a linked core index to a 2025 average of 100.
+
+    Args:
+        series (pd.Series): Unnormalized linked core index.
+        core (str): Derived COICOP code used in error messages.
+        geo (str): Geography code used in error messages.
+
+    Returns:
+        pd.Series: Normalized core index.
+
+    Raises:
+        RuntimeError: If no valid 2025 base is available.
+    """
+    base = series[series.index.str.startswith("2025")].mean()
     if pd.isna(base) or base == 0:
-        raise RuntimeError(
-            f"Cannot normalize {core} for {frame['geo'].iloc[0]}"
+        raise RuntimeError(f"Cannot normalize {core} for {geo}")
+    return series * 100 / base
+
+
+def core_index_series(
+    frame: pd.DataFrame,
+    core: str,
+    parent: str,
+    sub: str,
+) -> pd.DataFrame:
+    """Build a normalized chain-linked core index for one geography.
+
+    The parent index is decomposed into ``sub`` and a residual ``core``
+    using annual item weights and December link levels:
+
+        I_core = L_core * (
+            w_parent / w_core * I_parent / L_parent
+            - w_sub / w_core * I_sub / L_sub
         )
-    core_series *= 100 / base
+
+    The first available month is used as the initial link when the prior
+    December is unavailable. The result is rescaled so its 2025 average
+    is 100.
+
+    Args:
+        frame (pd.DataFrame): HICP rows for one geography containing
+            ``parent`` and ``sub``.
+        core (str): Derived COICOP code to assign to the result.
+        parent (str): Parent COICOP code, for example ``CP04``.
+        sub (str): Subcomponent COICOP code to remove, for example ``CP045``.
+
+    Returns:
+        pd.DataFrame: Rows for the derived component with the target table
+        columns.
+
+    Raises:
+        RuntimeError: If the result cannot be normalized to its 2025 base.
+    """
+    data = _prepare_core_data(frame, parent, sub)
+    if data.empty:
+        return pd.DataFrame(columns=PANEL_COLUMNS)
+
+    geo = str(data["geo"].iloc[0])
+    linked = _link_core_series(data)
+    core_series = _normalize_core_series(linked, core, geo)
 
     result = data.loc[core_series.index].copy()
     result["time_period"] = result.index
@@ -346,26 +457,18 @@ def core_index_series(
     result["item_weight"] = (
         result["item_weight_parent"] - result["item_weight_sub"]
     )
-    return result[
-        [
-            "time_period",
-            "geo",
-            "coicop",
-            "hicp_index",
-            "item_weight",
-            "country_weight",
-        ]
-    ].reset_index(drop=True)
+    return result[PANEL_COLUMNS].reset_index(drop=True)
 
 
 def add_core_components(conn: sqlite3.Connection) -> int:
     """Derive and insert the chain-linked core components.
 
     Args:
-        conn: SQLite connection containing the raw loaded panel.
+        conn (sqlite3.Connection): SQLite connection containing the raw
+            loaded panel.
 
     Returns:
-        Number of derived rows inserted.
+        int: Number of derived rows inserted.
     """
     codes = ["CP04", "CP045", "CP07", "CP0722"]
     placeholders = ",".join("?" for _ in codes)
@@ -414,9 +517,13 @@ def main(
     """Run the Eurostat HICP ETL pipeline.
 
     Args:
-        db_path: Destination SQLite database file.
-        start_year: First calendar year to load.
-        end_year: Last calendar year to load; defaults to the current year.
+        db_path (str): Destination SQLite database file.
+        start_year (int): First calendar year to load.
+        end_year (int | None): Last calendar year to load; defaults to the
+            current year.
+
+    Returns:
+        None: This function writes the SQLite database in place.
     """
     end_year = end_year or date.today().year
     total = 0
