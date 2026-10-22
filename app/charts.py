@@ -139,28 +139,6 @@ def series_figure(
             zorder=5,
         )
 
-    change = series_data.scenario - series_data.baseline
-    pct_change = 100.0 * (
-        series_data.scenario / series_data.baseline - 1.0
-    )
-    ax.text(
-        0.02,
-        0.06,
-        (
-            f"Scenario vs baseline: {change:+.2f} index pts "
-            f"({pct_change:+.2f}%)"
-        ),
-        transform=ax.transAxes,
-        fontsize=9,
-        color=SCENARIO,
-        bbox={
-            "facecolor": AX_BG,
-            "edgecolor": GRID,
-            "alpha": 0.9,
-            "pad": 2.5,
-        },
-    )
-
     ax.set_title(
         title,
         fontsize=14,
