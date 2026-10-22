@@ -1,4 +1,8 @@
-"""Plot historical HICP indices and a simultaneous two-shock scenario."""
+"""Plot historical HICP indices and a simultaneous two-shock scenario.
+
+CP045 and CP0722 are not pass-through targets, so their scenario values are
+derived by applying the origin shock to their own AR lag-0 coefficient.
+"""
 
 import argparse
 from pathlib import Path
@@ -49,7 +53,11 @@ def make_plot(
     shock_size: float,
     output: Path,
 ) -> Path:
-    """Render historical, conditional-baseline, and two-shock scenario panels."""
+    """Render historical, baseline, and two-shock scenario panels.
+
+    Multiplier targets use their conditional baseline plus pass-through. The
+    shock sources use their AR-only baseline plus their own lag-0 response.
+    """
     country_baselines = baselines[baselines["country"] == country]
     country_history = history[history["country"] == country]
     country_multipliers = multipliers[
@@ -69,7 +77,12 @@ def make_plot(
         raise ValueError(f"Duplicate multipliers for {country}")
 
     target_period = country_baselines["target_period"].iloc[0]
+    if "lag0_coefficient" not in country_baselines.columns:
+        raise ValueError(
+            "Baselines are missing lag0_coefficient; rerun hicp_forecast.py"
+        )
     baseline_map = country_baselines.set_index("coicop")["baseline_index_t3"]
+    lag0_map = country_baselines.set_index("coicop")["lag0_coefficient"]
     beta_table = country_multipliers.pivot(
         index="target_coicop",
         columns="shock_variable",
@@ -103,6 +116,16 @@ def make_plot(
         raise ValueError(
             f"Missing historical series for {country}: {sorted(missing_history)}"
         )
+
+    for component in SHOCK_COICOPS:
+        if component not in lag0_map.index:
+            raise ValueError(
+                f"Missing lag0 coefficient for {country}/{component}"
+            )
+        if not np.isfinite(float(lag0_map.loc[component])):
+            raise ValueError(
+                f"Invalid lag0 coefficient for {country}/{component}"
+            )
 
     ncols = 5
     nrows = int(np.ceil(len(components) / ncols))
@@ -163,11 +186,33 @@ def make_plot(
                 fontsize=7.5,
                 color=COLORS["scenario"],
             )
+        elif component in SHOCK_COICOPS:
+            delta_yoy = shock_size * float(lag0_map.loc[component])
+            scenario_index = baseline_index * np.exp(delta_yoy)
+            scenario_change = 100.0 * np.expm1(delta_yoy)
+            ax.scatter(
+                [target_period],
+                [scenario_index],
+                color=COLORS["scenario"],
+                edgecolor="white",
+                linewidth=0.6,
+                marker="*",
+                s=90,
+                zorder=5,
+            )
+            ax.text(
+                0.03,
+                0.06,
+                f"AR-only scenario vs baseline: {scenario_change:+.2f}%",
+                transform=ax.transAxes,
+                fontsize=7.5,
+                color=COLORS["scenario"],
+            )
         else:
             ax.text(
                 0.03,
                 0.06,
-                "AR-only baseline\nno pass-through multiplier",
+                "no pass-through multiplier",
                 transform=ax.transAxes,
                 fontsize=7.5,
                 color="#555555",
@@ -251,7 +296,8 @@ def make_plot(
         "Both CP045 and CP0722 receive a "
         f"+{shock_size:.2f} log-point shock at the origin. Baselines are "
         "conditional on realized shocks for multiplier targets; CP045 and "
-        "CP0722 use AR-only baselines.",
+        "CP0722 use AR-only baselines, with their own lag-0 AR coefficient "
+        "applied for the scenario.",
         ha="center",
         fontsize=8,
         color="#555555",

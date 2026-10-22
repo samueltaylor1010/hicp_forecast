@@ -73,6 +73,7 @@ BASELINE_COLUMNS = [
     "forecast_origin",
     "target_period",
     "baseline_index_t3",
+    "lag0_coefficient",
 ]
 MULTIPLIER_COLUMNS = [
     "country",
@@ -370,7 +371,8 @@ def fit_direct_model(
             empty tuple fits the AR-only energy baseline.
 
     Returns:
-        tuple[dict, list[dict]]: Baseline row and multiplier rows.
+        tuple[dict, list[dict]]: Baseline row, including its own lag-0
+        coefficient, and multiplier rows.
 
     Raises:
         ValueError: If too few complete training observations are available.
@@ -387,6 +389,7 @@ def fit_direct_model(
     coefficients = _solve_model(data, tuple(shock_coicops))
     forecast_row = _forecast_features(series, shocks, origin)
     yoy_forecast = float(forecast_row @ coefficients)
+    lag0_index = 1 + len(shock_coicops)
 
     baseline = {
         "country": geo,
@@ -396,6 +399,7 @@ def fit_direct_model(
         "baseline_index_t3": invert_yoy_forecast(
             wide, geo, coicop, origin, yoy_forecast
         ),
+        "lag0_coefficient": float(coefficients[lag0_index]),
     }
     multipliers = [
         {
@@ -516,6 +520,8 @@ def validate_artifacts(
         raise ValueError("Non-finite baseline indices")
     if not (baselines["baseline_index_t3"] > 0).all():
         raise ValueError("Non-positive baseline indices")
+    if not np.isfinite(baselines["lag0_coefficient"]).all():
+        raise ValueError("Non-finite lag0 coefficients")
     if not np.isfinite(multipliers["beta_multiplier"]).all():
         raise ValueError("Non-finite multipliers")
     if not (history["index_value"] > 0).all():
