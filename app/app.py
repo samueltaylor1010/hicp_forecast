@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -10,7 +11,7 @@ from shiny import reactive
 from shiny.express import input, render, ui
 
 try:
-    from .charts import component_grid_figure, headline_figure
+    from .charts import series_figure
     from .labels import (
         component_color_map,
         component_label,
@@ -19,16 +20,17 @@ try:
     )
     from .scenario_engine import (
         EA_GEO,
+        GraphSeries,
         aggregate_scenarios,
         load_dashboard_data,
         scenario_components,
         selected_component_contributions,
         selected_country_contributions,
+        selected_graph_series,
         selected_headline,
-        source_origin_indices,
     )
 except ImportError:  # Shinylive loads the app directory as top-level modules.
-    from charts import component_grid_figure, headline_figure
+    from charts import series_figure
     from labels import (
         component_color_map,
         component_label,
@@ -37,13 +39,14 @@ except ImportError:  # Shinylive loads the app directory as top-level modules.
     )
     from scenario_engine import (
         EA_GEO,
+        GraphSeries,
         aggregate_scenarios,
         load_dashboard_data,
         scenario_components,
         selected_component_contributions,
         selected_country_contributions,
+        selected_graph_series,
         selected_headline,
-        source_origin_indices,
     )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -56,6 +59,13 @@ GEO_CHOICES = {
     EA_GEO: "Euro area (EA)",
     **COUNTRY_CHOICES,
 }
+SERIES_CHOICES = {
+    "HEADLINE": "Headline HICP",
+    **{
+        code: f"{code} — {component_label(code)}"
+        for code in DATA.coicops
+    },
+}
 COMPONENT_COLORS = component_color_map(list(DATA.coicops))
 COUNTRY_COLORS = country_color_map(list(DATA.countries))
 DEFAULT_SHOCK = 10.0
@@ -65,51 +75,52 @@ def _fmt_signed(value: float, digits: int = 2) -> str:
     return f"{value:+.{digits}f}"
 
 
-def _kpi_html(geo: str, aggregation) -> str:
-    selected = selected_headline(aggregation, geo)
-    ea = aggregation.ea_headline
-    return f"""
-    <div class="kpi-grid">
-      <div class="kpi">
-        <div class="kpi-label">{html.escape(country_label(geo))}</div>
-        <div class="kpi-value">{_fmt_signed(selected["delta"])} pts</div>
-        <div class="kpi-sub">{_fmt_signed(selected["pct_change"])}% vs baseline</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">EA headline</div>
-        <div class="kpi-value">{_fmt_signed(ea["delta"])} pts</div>
-        <div class="kpi-sub">{_fmt_signed(ea["pct_change"])}% vs baseline</div>
-      </div>
-    </div>
-    """
+def _parse_shock_text(raw: str | None) -> tuple[float | None, str | None]:
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "Enter a number."
+    if not math.isfinite(value):
+        return None, "Enter a finite number."
+    if value <= -100.0:
+        return None, "Shock must be greater than -100%."
+    return value, None
 
 
-def _origin_html(geo: str, shock_percent: float) -> str:
-    frame = source_origin_indices(DATA, geo, shock_percent)
-    note = (
-        f"Shock applied to the latest index at "
-        f"{DATA.origin:%Y-%m}."
-    )
-    rows = []
-    for _, row in frame.iterrows():
-        code = str(row["coicop"])
-        rows.append(
-            f"""
-            <tr>
-              <td>{html.escape(code)}</td>
-              <td>{row["origin_index"]:.2f}</td>
-              <td class="shocked-value">{row["shocked_origin_index"]:.2f}</td>
-            </tr>
-            """
-        )
+def _fmt_input(value: float) -> str:
+    return f"{value:g}"
+
+
+def _metrics_html(graph: GraphSeries) -> str:
+    baseline_change = graph.baseline - graph.origin_index
+    scenario_change = graph.scenario - graph.origin_index
+    delta = graph.scenario - graph.baseline
+    baseline_pct = 100.0 * (graph.baseline / graph.origin_index - 1.0)
+    scenario_pct = 100.0 * (graph.scenario / graph.origin_index - 1.0)
+    delta_pct = 100.0 * (graph.scenario / graph.baseline - 1.0)
     return f"""
-    <div class="origin-note">
-      <div class="origin-note-title">{html.escape(country_label(geo))}</div>
-      <div class="muted">{html.escape(note)}</div>
-      <table class="origin-table">
-        <thead><tr><th>Source</th><th>Origin</th><th>Shocked</th></tr></thead>
-        <tbody>{''.join(rows)}</tbody>
-      </table>
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">Baseline change</div>
+        <div class="metric-value baseline">{_fmt_signed(baseline_change)} pts</div>
+        <div class="metric-sub">
+          {_fmt_signed(baseline_pct)}% vs origin {DATA.origin:%Y-%m}
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Shocked change</div>
+        <div class="metric-value shocked">{_fmt_signed(scenario_change)} pts</div>
+        <div class="metric-sub">
+          {_fmt_signed(scenario_pct)}% vs origin {DATA.origin:%Y-%m}
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Delta</div>
+        <div class="metric-value delta">{_fmt_signed(delta)} pts</div>
+        <div class="metric-sub">
+          {_fmt_signed(delta_pct)}% shocked vs baseline
+        </div>
+      </div>
     </div>
     """
 
@@ -148,11 +159,12 @@ def _bar_html(
     title: str,
     total: float,
     total_pct: float,
+    card_class: str,
 ) -> str:
     clean = frame.loc[frame["contribution"].abs() > 1e-12].copy()
     if clean.empty:
         return f"""
-        <div class="contrib-card">
+        <div class="contrib-card {html.escape(card_class)}">
           <div class="contrib-head">
             <span>{html.escape(title)}</span>
             <span class="total-value">0.00 pts</span>
@@ -245,7 +257,7 @@ def _bar_html(
         )
 
     return f"""
-    <div class="contrib-card">
+    <div class="contrib-card {html.escape(card_class)}">
       <div class="contrib-head">
         <span>{html.escape(title)}</span>
         <span class="total-value">{_fmt_signed(total)} pts
@@ -265,6 +277,7 @@ def _bar_html(
     """
 
 
+uniform_shock = reactive.value(DEFAULT_SHOCK)
 shock_values = reactive.value(
     {country: 0.0 for country in DATA.countries}
 )
@@ -273,7 +286,7 @@ shock_values = reactive.value(
 @reactive.calc
 def effective_shocks() -> dict[str, float]:
     if input.scope() == "uniform":
-        value = float(input.shock())
+        value = float(uniform_shock())
         return {country: value for country in DATA.countries}
     return dict(shock_values())
 
@@ -288,6 +301,36 @@ def aggregation():
     return aggregate_scenarios(DATA, scenario())
 
 
+@reactive.calc
+def graph_series():
+    geo = input.geo()
+    shocks = effective_shocks()
+    shock_percent = (
+        float(shocks[geo]) if geo in DATA.countries else None
+    )
+    return selected_graph_series(
+        DATA,
+        aggregation(),
+        geo,
+        input.series(),
+        shock_percent,
+    )
+
+
+@reactive.effect
+@reactive.event(input.shock)
+def _store_shock_input() -> None:
+    value, error = _parse_shock_text(input.shock())
+    if error is not None or value is None:
+        return
+    if input.scope() == "uniform":
+        uniform_shock.set(value)
+        return
+    state = dict(shock_values())
+    state[input.shock_country()] = value
+    shock_values.set(state)
+
+
 @reactive.effect
 @reactive.event(input.geo)
 def _sync_shock_country_with_geo() -> None:
@@ -297,63 +340,63 @@ def _sync_shock_country_with_geo() -> None:
     if geo not in DATA.countries:
         return
     ui.update_select("shock_country", selected=geo)
-    ui.update_slider(
-        "shock", value=float(shock_values().get(geo, DEFAULT_SHOCK))
+    ui.update_text(
+        "shock",
+        value=_fmt_input(float(shock_values().get(geo, 0.0))),
     )
 
 
 @reactive.effect
 @reactive.event(input.shock_country)
-def _sync_slider_to_country() -> None:
+def _sync_text_to_country() -> None:
     if input.scope() != "country":
         return
     country = input.shock_country()
-    ui.update_slider(
-        "shock", value=float(shock_values().get(country, DEFAULT_SHOCK))
+    ui.update_text(
+        "shock",
+        value=_fmt_input(float(shock_values().get(country, 0.0))),
     )
 
 
 @reactive.effect
 @reactive.event(input.scope)
-def _sync_slider_to_scope() -> None:
-    if input.scope() == "country":
+def _sync_text_to_scope() -> None:
+    if input.scope() == "uniform":
+        ui.update_text("shock", value=_fmt_input(float(uniform_shock())))
+    else:
         country = input.shock_country()
-        ui.update_slider(
-            "shock", value=float(shock_values().get(country, DEFAULT_SHOCK))
+        ui.update_text(
+            "shock",
+            value=_fmt_input(float(shock_values().get(country, 0.0))),
         )
-
-
-@reactive.effect
-@reactive.event(input.shock)
-def _store_country_shock() -> None:
-    if input.scope() != "country":
-        return
-    state = dict(shock_values())
-    state[input.shock_country()] = float(input.shock())
-    shock_values.set(state)
 
 
 @reactive.effect
 @reactive.event(input.apply_all)
 def _apply_to_all() -> None:
-    value = float(input.shock())
+    value, error = _parse_shock_text(input.shock())
+    if error is not None or value is None:
+        return
+    uniform_shock.set(value)
     shock_values.set({country: value for country in DATA.countries})
 
 
 @reactive.effect
 @reactive.event(input.reset_all)
 def _reset_all() -> None:
+    uniform_shock.set(DEFAULT_SHOCK)
     shock_values.set(
         {country: DEFAULT_SHOCK for country in DATA.countries}
     )
-    ui.update_slider("shock", value=DEFAULT_SHOCK)
+    ui.update_text("shock", value=_fmt_input(DEFAULT_SHOCK))
 
 
 @reactive.effect
 @reactive.event(input.zero_all)
 def _zero_all() -> None:
+    uniform_shock.set(0.0)
     shock_values.set({country: 0.0 for country in DATA.countries})
-    ui.update_slider("shock", value=0.0)
+    ui.update_text("shock", value="0")
 
 
 ui.page_opts(
@@ -366,10 +409,7 @@ with ui.div(class_="app-shell"):
     with ui.div(class_="panel panel-left"):
         ui.h1("HICP shock simulator", class_="app-title")
         ui.div(
-            (
-                f"Origin {DATA.origin:%Y-%m} → target "
-                f"{DATA.target_period:%Y-%m} · weights {DATA.weight_year}"
-            ),
+            "Modelling energy shock effects at a 3 month horizon",
             class_="app-subtitle",
         )
 
@@ -402,24 +442,19 @@ with ui.div(class_="app-shell"):
                 class_="muted small-note",
             )
 
-        ui.h3("Shock to latest CP045 + CP0722 index", class_="control-title")
-        ui.div(
-            "Percent change applied at the origin index. "
-            "The fitted lag/pass-through coefficients then determine the "
-            "target-period response.",
-            class_="muted small-note",
+        ui.input_text(
+            "shock",
+            "Shock to latest CP045 + CP0722 index (%)",
+            value=_fmt_input(DEFAULT_SHOCK),
+            placeholder="e.g. 10",
         )
-        with ui.div(class_="vertical-slider-outer"):
-            with ui.div(class_="vertical-slider-inner"):
-                ui.input_slider(
-                    "shock",
-                    None,
-                    min=-50,
-                    max=50,
-                    value=DEFAULT_SHOCK,
-                    step=1,
-                    post="%",
-                )
+
+        @render.ui
+        def shock_error():
+            _, error = _parse_shock_text(input.shock())
+            if error is None:
+                return ui.HTML("")
+            return ui.div(error, class_="input-error")
 
         with ui.div(class_="button-row"):
             ui.input_action_button(
@@ -438,66 +473,23 @@ with ui.div(class_="app-shell"):
                 class_="btn-secondary btn-sm",
             )
 
-        @render.ui
-        def origin_summary():
-            if input.scope() == "country":
-                geo = input.shock_country()
-                shock = float(shock_values().get(geo, DEFAULT_SHOCK))
-            else:
-                geo = input.geo()
-                shock = float(input.shock())
-            return ui.HTML(_origin_html(geo, shock))
-
-        @render.ui
-        def kpis():
-            return ui.HTML(_kpi_html(input.geo(), aggregation()))
-
-        ui.div(
-            (
-                "The country bar is a single segment when a country is "
-                "selected. Select Euro area to see the country decomposition."
-            ),
-            class_="muted footer-note",
-        )
-
     with ui.div(class_="panel panel-center"):
         with ui.div(class_="center-head"):
             ui.h2("Scenario graph", class_="section-title")
-            ui.input_radio_buttons(
-                "view",
-                None,
-                choices={
-                    "headline": "Headline index",
-                    "components": "All components",
-                },
-                selected="headline",
-                inline=True,
+            ui.input_select(
+                "series",
+                "Series",
+                choices=SERIES_CHOICES,
+                selected="HEADLINE",
             )
 
-        with ui.panel_conditional("input.view === 'headline'"):
-            @render.plot(height=520)
-            def headline_plot():
-                return headline_figure(DATA, aggregation(), input.geo())
+        @render.ui
+        def graph_metrics():
+            return ui.HTML(_metrics_html(graph_series()))
 
-        with ui.panel_conditional("input.view === 'components'"):
-            @render.plot(height=1080)
-            def component_plot():
-                shocks = effective_shocks()
-                shock_percent = (
-                    float(input.shock())
-                    if input.scope() == "uniform"
-                    else (
-                        float(shocks[input.geo()])
-                        if input.geo() in DATA.countries
-                        else None
-                    )
-                )
-                return component_grid_figure(
-                    DATA,
-                    aggregation(),
-                    input.geo(),
-                    shock_percent,
-                )
+        @render.plot(height=620)
+        def graph_plot():
+            return series_figure(DATA, graph_series(), input.geo())
 
         ui.div(
             (
@@ -531,6 +523,7 @@ with ui.div(class_="app-shell"):
                         title="By component",
                         total=total["delta"],
                         total_pct=total["pct_change"],
+                        card_class="component-card",
                     )
                 )
 
@@ -552,6 +545,7 @@ with ui.div(class_="app-shell"):
                         title="By country",
                         total=total["delta"],
                         total_pct=total["pct_change"],
+                        card_class="country-card",
                     )
                 )
 

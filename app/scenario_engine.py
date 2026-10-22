@@ -68,6 +68,17 @@ class AggregationResult:
     ea_countries: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class GraphSeries:
+    code: str
+    history: pd.DataFrame
+    origin_index: float
+    baseline: float
+    scenario: float
+    is_source: bool
+    shock_percent: float | None
+
+
 def load_dashboard_data(data_dir: str | Path) -> DashboardData:
     data_dir = Path(data_dir)
     baselines = pd.read_csv(
@@ -532,13 +543,42 @@ def component_levels(
     return frame.set_index("coicop")[["baseline", "scenario", "delta"]]
 
 
-def source_origin_indices(
-    data: DashboardData, geo: str, shock_percent: float
-) -> pd.DataFrame:
-    history = component_history(data, geo)
-    origin_values = history.loc[data.origin, list(SHOCK_COICOPS)]
-    frame = origin_values.rename("origin_index").reset_index()
-    frame["shocked_origin_index"] = frame["origin_index"] * (
-        1.0 + shock_percent / 100.0
+def selected_graph_series(
+    data: DashboardData,
+    aggregation: AggregationResult,
+    geo: str,
+    series: str,
+    shock_percent: float | None = None,
+) -> GraphSeries:
+    """Return the history and target levels for one graph series."""
+    if series == "HEADLINE":
+        history = headline_history(data, geo)
+        levels = selected_headline(aggregation, geo)
+    else:
+        if series not in data.coicops:
+            raise ValueError(f"Unknown graph series: {series}")
+        history = (
+            component_history(data, geo)[series]
+            .dropna()
+            .rename("index_value")
+            .reset_index()
+        )
+        row = component_levels(aggregation, geo).loc[series]
+        levels = {
+            "baseline": float(row["baseline"]),
+            "scenario": float(row["scenario"]),
+        }
+
+    origin_rows = history.loc[history["date"] == data.origin, "index_value"]
+    if origin_rows.empty:
+        raise ValueError(f"No origin observation for {geo}/{series}")
+    return GraphSeries(
+        code=series,
+        history=history[["date", "index_value"]].reset_index(drop=True),
+        origin_index=float(origin_rows.iloc[0]),
+        baseline=float(levels["baseline"]),
+        scenario=float(levels["scenario"]),
+        is_source=series in SHOCK_COICOPS,
+        shock_percent=shock_percent,
     )
-    return frame
+

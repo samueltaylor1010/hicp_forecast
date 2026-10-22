@@ -5,12 +5,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from app.charts import component_grid_figure, headline_figure
+from app.charts import series_figure
 from app.scenario_engine import (
     EA_GEO,
     aggregate_scenarios,
     load_dashboard_data,
     scenario_components,
+    selected_graph_series,
 )
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "app" / "data"
@@ -55,7 +56,7 @@ def test_official_histories_cover_all_geographies():
     assert not ea_components.duplicated(["coicop", "date"]).any()
 
 
-def test_charts_render_for_headline_and_component_views():
+def test_charts_render_for_all_series_and_selected_geographies():
     data = load_dashboard_data(DATA_DIR)
     scenario = scenario_components(
         data, {country: 10.0 for country in data.countries}
@@ -63,5 +64,12 @@ def test_charts_render_for_headline_and_component_views():
     aggregation = aggregate_scenarios(data, scenario)
 
     for geo in ["FR", "DE", EA_GEO]:
-        headline_figure(data, aggregation, geo)
-        component_grid_figure(data, aggregation, geo, 10.0)
+        for series in ["HEADLINE", *data.coicops]:
+            graph = selected_graph_series(
+                data,
+                aggregation,
+                geo,
+                series,
+                10.0,
+            )
+            series_figure(data, graph, geo)

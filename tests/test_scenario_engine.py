@@ -10,11 +10,13 @@ from app.scenario_engine import (
     EA_GEO,
     SHOCK_COICOPS,
     aggregate_scenarios,
+    headline_history,
     load_dashboard_data,
     percent_to_log_shock,
     scenario_components,
     selected_component_contributions,
     selected_country_contributions,
+    selected_graph_series,
     selected_headline,
 )
 
@@ -156,3 +158,32 @@ def test_all_geographies_have_headline_and_component_history(data):
         assert len(components) > 0
         countries = selected_country_contributions(aggregation, geo)
         assert len(countries) > 0
+
+
+def test_selected_graph_series_matches_aggregation(data):
+    scenario = scenario_components(data, _uniform(10.0, data.countries))
+    aggregation = aggregate_scenarios(data, scenario)
+
+    headline = selected_graph_series(
+        data, aggregation, "FR", "HEADLINE", 10.0
+    )
+    levels = selected_headline(aggregation, "FR")
+    expected_origin = headline_history(data, "FR").loc[
+        lambda frame: frame["date"] == data.origin, "index_value"
+    ].iloc[0]
+    assert headline.origin_index == pytest.approx(expected_origin)
+    assert headline.baseline == pytest.approx(levels["baseline"])
+    assert headline.scenario == pytest.approx(levels["scenario"])
+
+    component = selected_graph_series(
+        data, aggregation, "FR", "CP045", 10.0
+    )
+    assert component.is_source
+    assert component.shock_percent == pytest.approx(10.0)
+    assert component.origin_index == pytest.approx(
+        data.history[
+            (data.history["country"] == "FR")
+            & (data.history["date"] == data.origin)
+            & (data.history["coicop"] == "CP045")
+        ]["index_value"].iloc[0]
+    )

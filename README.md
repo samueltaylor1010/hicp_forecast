@@ -7,10 +7,10 @@ an interactive energy-shock simulation dashboard.
 
 The dashboard is a Shiny Express app in `app/`. It has three panels:
 
-- left: graph geography, uniform vs country-specific shock scope, and a vertical
-  percent-shock slider;
-- centre: either the selected geography's headline index history plus baseline
-  and scenario points, or the full 15-component grid;
+- left: graph geography, uniform vs country-specific shock scope, and a
+  percent-shock text input;
+- centre: a dropdown for the headline index or any single component, three
+  origin-to-baseline/scenario metrics, and a single dark-themed index graph;
 - right: index-point contributions to the selected geography's increase, split
   by component and by country.
 
