@@ -1,4 +1,4 @@
-"""Interactive HICP energy shock simulation using country and item weights."""
+# HICP energy shock dashboard.
 
 from __future__ import annotations
 
@@ -400,8 +400,8 @@ def _zero_all() -> None:
 
 
 ui.page_opts(
-    title="HICP energy shock dashboard",
     fillable=True,
+    window_title="HICP shock simulator",
 )
 ui.include_css(Path(__file__).resolve().parent / "www" / "styles.css")
 
