@@ -166,7 +166,7 @@ def series_figure(
             marker="o",
             linestyle="None",
             markersize=7,
-            label=f"Conditional baseline t+3 ({target:%Y-%m})",
+            label="Baseline Forecast",
         ),
         Line2D(
             [0],
