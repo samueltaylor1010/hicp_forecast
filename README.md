@@ -15,17 +15,42 @@ The dashboard is a Shiny Express app in `app/`. It has three panels:
   by component and by country.
 
 The shock is a **percent change to the latest origin index of CP045 and CP0722**.
-The log shock is propagated to the target period with the fitted direct-horizon
+The resulting log shock raises both the origin YoY rate and its 1-month change
+by `s`. It is propagated to the target period with the fitted direct-horizon
 coefficients:
 
 ```text
 s = log(1 + percent / 100)
 
-pass-through targets: d = s * (beta_CP045 + beta_CP0722)
-CP045 / CP0722:        d = s * lag0
+target components: d = s * (beta_CP045 + beta_CP0722)
+CP045 / CP0722:    d = s * (1 + lag0)
 
-scenario index: S = baseline_index * exp(d)
+scenario index:    S = baseline_index * exp(d)
 ```
+
+The extra unit for CP045/CP0722 is the direct shift in the origin YoY level,
+which enters because the model forecasts `y_{t+3} - y_t` and the app
+reconstructs `y_{t+3} = y_t + delta` before converting back to an index.
+
+### Forecast model
+
+The target is the 3-month cumulative change in the YoY log difference:
+
+```text
+y_t  = log(P_t) - log(P_{t-12})
+dy_t = y_t - y_{t-1}
+
+y_{t+3} - y_t = alpha
+              + beta_1 * ds1_t + beta_2 * ds2_t
+              + gamma_0 * dy_t + gamma_1 * dy_{t-1}
+              + gamma_2 * dy_{t-2} + gamma_3 * dy_{t-3}
+              + gamma_12 * dy_{t-12} + error
+```
+
+`ds1_t` and `ds2_t` are the contemporaneous 1-month changes in the CP045 and
+CP0722 YoY rates. `lag0_coefficient` in the artifacts is the fitted
+`gamma_0` coefficient on `dy_t`. All coefficients are estimated jointly with
+`scipy.optimize.lsq_linear` and are unbounded.
 
 EA aggregates are built bottom-up using 2026 country and item weights from
 `data/hicp.db`. The dashboard never reads SQLite at runtime.

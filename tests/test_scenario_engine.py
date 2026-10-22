@@ -46,10 +46,10 @@ def test_positive_shock_uses_origin_index_percent(data):
     log_shock = np.log(1.10)
 
     assert fr.loc["CP045", "delta_log"] == pytest.approx(
-        log_shock * data.lag0_wide.loc["FR", "CP045"]
+        log_shock * (1.0 + data.lag0_wide.loc["FR", "CP045"])
     )
     assert fr.loc["CP0722", "delta_log"] == pytest.approx(
-        log_shock * data.lag0_wide.loc["FR", "CP0722"]
+        log_shock * (1.0 + data.lag0_wide.loc["FR", "CP0722"])
     )
     assert fr.loc["CP01", "delta_log"] == pytest.approx(
         log_shock * data.beta_sum_wide.loc["FR", "CP01"]
@@ -64,6 +64,16 @@ def test_positive_shock_uses_origin_index_percent(data):
         )
 
 
+def test_source_shock_includes_origin_level_effect(data):
+    scenario = scenario_components(data, _uniform(10.0, data.countries))
+    fr = scenario[scenario["country"] == "FR"].set_index("coicop")
+    log_shock = np.log(1.10)
+
+    for code in SHOCK_COICOPS:
+        expected = log_shock * (1.0 + data.lag0_wide.loc["FR", code])
+        assert fr.loc[code, "delta_log"] == pytest.approx(expected)
+
+
 def test_cli_equivalent_log_shock(data):
     cli_log_shock = 0.10
     equivalent_percent = 100.0 * np.expm1(cli_log_shock)
@@ -76,7 +86,7 @@ def test_cli_equivalent_log_shock(data):
         cli_log_shock * data.beta_sum_wide.loc["FR", "CP01"]
     )
     assert fr.loc["CP045", "delta_log"] == pytest.approx(
-        cli_log_shock * data.lag0_wide.loc["FR", "CP045"]
+        cli_log_shock * (1.0 + data.lag0_wide.loc["FR", "CP045"])
     )
 
 

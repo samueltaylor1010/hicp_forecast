@@ -1,9 +1,12 @@
 """Scenario and EA aggregation engine for the dashboard.
 
 The dashboard shock is a percent change to the latest origin index of CP045
-and CP0722. The resulting log shock is propagated to the target period with
-the fitted direct-horizon pass-through coefficients. All EA and country
-aggregates are bottom-up using HICP country and item weights.
+and CP0722. A shock of ``s = log(1 + percent / 100)`` raises both the origin
+YoY rate and its 1-month change by ``s``. Target components receive the
+fitted ``ds`` pass-through. Shock sources also receive the direct ``s`` level
+shift because their target-period YoY forecast is reconstructed as
+``y_origin + delta``. All EA and country aggregates are bottom-up using HICP
+country and item weights.
 """
 
 from __future__ import annotations
@@ -256,7 +259,11 @@ def _validate_frames(
 
 
 def percent_to_log_shock(percent: float) -> float:
-    """Convert a percent change in the latest index to a log shock."""
+    """Convert an origin-index percent change to its YoY log change.
+
+    The result is also the induced change in the 1-month YoY change at the
+    forecast origin.
+    """
     if not np.isfinite(percent) or percent <= -100.0:
         raise ValueError("Shock percent must be finite and greater than -100")
     return float(np.log1p(percent / 100.0))
@@ -269,8 +276,10 @@ def scenario_components(
     """Apply origin-index shocks and return target component scenarios.
 
     The shock is applied to the latest origin index of CP045 and CP0722. Its
-    log value is propagated to the target period with lag0 for the shock
-    sources and with the sum of the two pass-through betas for targets.
+    log value is propagated to the target period with ``1 + dy0`` for the
+    shock sources and with the sum of the two pass-through betas for targets.
+    The extra unit for sources is the direct shift in the origin YoY rate
+    that is carried into the reconstructed target-period YoY forecast.
     """
     percentages = np.array(
         [
@@ -287,12 +296,12 @@ def scenario_components(
     log_shocks = np.log1p(percentages / 100.0)[:, None]
     baseline = data.baseline_wide.to_numpy(dtype=float)
     beta_sum = data.beta_sum_wide.to_numpy(dtype=float)
-    lag0 = data.lag0_wide.to_numpy(dtype=float)
+    dy0 = data.lag0_wide.to_numpy(dtype=float)
     delta_log = log_shocks * beta_sum
 
     for index, coicop in enumerate(data.coicops):
         if coicop in SHOCK_COICOPS:
-            delta_log[:, index] = log_shocks[:, 0] * lag0[:, index]
+            delta_log[:, index] = log_shocks[:, 0] * (1.0 + dy0[:, index])
 
     scenario = baseline * np.exp(delta_log)
 

@@ -1,10 +1,12 @@
 """Forecast HICP components and estimate energy shock pass-through.
 
 The pipeline keeps the 21 euro-area member countries and the mutually
-exclusive COICOP components. Each non-energy target is fitted once on both
-CP045 and CP0722 YoY shocks plus its own lags. That single joint fit produces
-the conditional baseline and both pass-through multipliers. CP045 and CP0722
-remain excluded as multiplier targets and receive AR-only baselines.
+exclusive COICOP components. Each target is fitted on the 1-month change in
+its YoY log difference plus, for non-energy targets, the contemporaneous
+1-month changes in the CP045 and CP0722 YoY rates. That single joint fit
+produces the conditional baseline and both pass-through multipliers. CP045
+and CP0722 remain excluded as multiplier targets and receive AR-only
+baselines.
 """
 
 import argparse
@@ -178,15 +180,16 @@ def _find_origin(wide: pd.DataFrame) -> pd.Timestamp:
 
 def build_panel(
     frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
-    """Pivot the panel, compute YoY log differences, and find the origin.
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+    """Pivot the panel, compute YoY changes, and find the origin.
 
     Args:
         frame (pd.DataFrame): Validated long HICP panel.
 
     Returns:
-        tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]: Wide index panel,
-        YoY log differences, and the common forecast origin.
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Timestamp]: Wide
+        index panel, YoY log differences, 1-month changes in those YoY log
+        differences, and the common forecast origin.
 
     Raises:
         ValueError: If any country-component series is empty or origin
@@ -208,42 +211,54 @@ def build_panel(
         raise ValueError(f"Series with no observations: {missing}")
 
     yoy = np.log(wide / wide.shift(12))
+    dy = yoy.diff()
     origin = _find_origin(wide)
 
     required_dates = [
-        origin - pd.DateOffset(months=offset) for offset in range(4)
+        origin - pd.DateOffset(months=offset)
+        for offset in (0, 1, 2, 3, 12, 13)
     ]
     if not all(date in yoy.index for date in required_dates):
         raise ValueError("Insufficient history at the forecast origin")
     if yoy.loc[required_dates].isna().any().any():
         raise ValueError("Missing YoY history at the forecast origin")
 
-    return wide, yoy, origin
+    dy_dates = [
+        origin - pd.DateOffset(months=offset)
+        for offset in (0, 1, 2, 3, 12)
+    ]
+    if dy.loc[dy_dates].isna().any().any():
+        raise ValueError("Missing YoY-change history at the forecast origin")
+
+    return wide, yoy, dy, origin
 
 
 def _training_frame(
     series: pd.Series,
+    dy: pd.Series,
     shocks: dict[str, pd.Series] | None = None,
     horizon: int = HORIZON,
 ) -> pd.DataFrame:
-    """Build a direct-horizon target, optional shocks, and four own lags.
+    """Build a cumulative-horizon target, optional shocks, and own lags.
 
     Args:
-        series (pd.Series): Target YoY series.
-        shocks (dict[str, pd.Series] | None): Optional shock series keyed by
-            COICOP code.
+        series (pd.Series): Target YoY log-difference series.
+        dy (pd.Series): 1-month change in the target YoY series.
+        shocks (dict[str, pd.Series] | None): Optional 1-month YoY-change
+            shock series keyed by COICOP code.
         horizon (int): Direct forecast horizon in months.
 
     Returns:
         pd.DataFrame: Complete training rows containing ``target``, optional
-        ``shock_*`` columns, and ``lag0`` through ``lag3``.
+        ``shock_*`` columns, and ``dy0`` through ``dy3`` plus ``dy12``.
     """
     data = {
-        "target": series.shift(-horizon),
-        "lag0": series,
-        "lag1": series.shift(1),
-        "lag2": series.shift(2),
-        "lag3": series.shift(3),
+        "target": series.shift(-horizon) - series,
+        "dy0": dy,
+        "dy1": dy.shift(1),
+        "dy2": dy.shift(2),
+        "dy3": dy.shift(3),
+        "dy12": dy.shift(12),
     }
     for coicop, shock in (shocks or {}).items():
         data[f"shock_{coicop}"] = shock
@@ -251,15 +266,16 @@ def _training_frame(
 
 
 def _forecast_features(
-    series: pd.Series,
+    dy: pd.Series,
     shocks: dict[str, pd.Series],
     origin: pd.Timestamp,
 ) -> np.ndarray:
     """Build the origin-valued predictor row for a direct forecast.
 
     Args:
-        series (pd.Series): Target YoY series.
-        shocks (dict[str, pd.Series]): Shock series keyed by COICOP code.
+        dy (pd.Series): 1-month change in the target YoY series.
+        shocks (dict[str, pd.Series]): 1-month YoY-change shock series keyed
+            by COICOP code.
         origin (pd.Timestamp): Forecast origin.
 
     Returns:
@@ -270,8 +286,8 @@ def _forecast_features(
             1.0,
             *[float(shock.loc[origin]) for shock in shocks.values()],
             *[
-                float(series.loc[origin - pd.DateOffset(months=offset)])
-                for offset in range(4)
+                float(dy.loc[origin - pd.DateOffset(months=offset)])
+                for offset in (0, 1, 2, 3, 12)
             ],
         ]
     )
@@ -306,7 +322,7 @@ def _solve_model(
     data: pd.DataFrame,
     shock_names: tuple[str, ...],
 ) -> np.ndarray:
-    """Estimate one direct model, using the appropriate OLS solver branch.
+    """Estimate one direct model with unbounded least squares.
 
     Args:
         data (pd.DataFrame): Training rows with target, lags, and optional
@@ -318,14 +334,15 @@ def _solve_model(
         np.ndarray: Estimated coefficient vector.
 
     Raises:
-        RuntimeError: If the bounded least-squares solver fails.
+        RuntimeError: If the least-squares solver fails.
     """
     predictor_columns = [
         *[f"shock_{shock}" for shock in shock_names],
-        "lag0",
-        "lag1",
-        "lag2",
-        "lag3",
+        "dy0",
+        "dy1",
+        "dy2",
+        "dy3",
+        "dy12",
     ]
     design = np.column_stack(
         [
@@ -334,18 +351,15 @@ def _solve_model(
         ]
     )
     target = data["target"].to_numpy(dtype=float)
-
-    if not shock_names:
-        coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
-        return coefficients
+    bounds = (
+        np.full(design.shape[1], -np.inf),
+        np.full(design.shape[1], np.inf),
+    )
 
     result = lsq_linear(
         design,
         target,
-        bounds=(
-            np.full(design.shape[1], -np.inf),
-            np.full(design.shape[1], np.inf),
-        ),
+        bounds=bounds,
         max_iter=1000,
     )
     if not result.success:
@@ -356,6 +370,7 @@ def _solve_model(
 def fit_direct_model(
     wide: pd.DataFrame,
     yoy: pd.DataFrame,
+    dy: pd.DataFrame,
     geo: str,
     coicop: str,
     origin: pd.Timestamp,
@@ -366,6 +381,7 @@ def fit_direct_model(
     Args:
         wide (pd.DataFrame): Wide index panel.
         yoy (pd.DataFrame): Wide YoY log-difference panel.
+        dy (pd.DataFrame): Wide 1-month change in the YoY panel.
         geo (str): Country code.
         coicop (str): Target component code.
         origin (pd.Timestamp): Forecast origin.
@@ -373,7 +389,7 @@ def fit_direct_model(
             empty tuple fits the AR-only energy baseline.
 
     Returns:
-        tuple[dict, list[dict]]: Baseline row, including its own lag-0
+        tuple[dict, list[dict]]: Baseline row, including its own dy-0
         coefficient, and multiplier rows.
 
     Raises:
@@ -381,17 +397,19 @@ def fit_direct_model(
         RuntimeError: If the shock model solver fails.
     """
     series = yoy[(geo, coicop)]
-    shocks = {shock: yoy[(geo, shock)] for shock in shock_coicops}
-    data = _training_frame(series, shocks)
+    target_dy = dy[(geo, coicop)]
+    shocks = {shock: dy[(geo, shock)] for shock in shock_coicops}
+    data = _training_frame(series, target_dy, shocks)
     if len(data) < MIN_OBS:
         raise ValueError(
             f"Insufficient observations for {geo}/{coicop}: {len(data)}"
         )
 
     coefficients = _solve_model(data, tuple(shock_coicops))
-    forecast_row = _forecast_features(series, shocks, origin)
-    yoy_forecast = float(forecast_row @ coefficients)
-    lag0_index = 1 + len(shock_coicops)
+    forecast_row = _forecast_features(target_dy, shocks, origin)
+    delta_yoy = float(forecast_row @ coefficients)
+    yoy_forecast = float(series.loc[origin]) + delta_yoy
+    dy0_index = 1 + len(shock_coicops)
 
     baseline = {
         "country": geo,
@@ -401,7 +419,7 @@ def fit_direct_model(
         "baseline_index_t3": invert_yoy_forecast(
             wide, geo, coicop, origin, yoy_forecast
         ),
-        "lag0_coefficient": float(coefficients[lag0_index]),
+        "lag0_coefficient": float(coefficients[dy0_index]),
     }
     multipliers = [
         {
@@ -418,6 +436,7 @@ def fit_direct_model(
 def build_artifacts(
     wide: pd.DataFrame,
     yoy: pd.DataFrame,
+    dy: pd.DataFrame,
     origin: pd.Timestamp,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fit every retained series once and build output tables.
@@ -425,6 +444,7 @@ def build_artifacts(
     Args:
         wide (pd.DataFrame): Wide index panel.
         yoy (pd.DataFrame): Wide YoY log-difference panel.
+        dy (pd.DataFrame): Wide 1-month change in the YoY panel.
         origin (pd.Timestamp): Forecast origin.
 
     Returns:
@@ -437,7 +457,7 @@ def build_artifacts(
         for coicop in RETAINED_COICOPS:
             shocks = SHOCKS if coicop in TARGET_COICOPS else ()
             baseline, multipliers = fit_direct_model(
-                wide, yoy, geo, coicop, origin, shocks
+                wide, yoy, dy, geo, coicop, origin, shocks
             )
             baseline_rows.append(baseline)
             multiplier_rows.extend(multipliers)
@@ -583,7 +603,7 @@ def main(
     )
 
     panel = load_panel(db_path)
-    wide, yoy, origin = build_panel(panel)
+    wide, yoy, dy, origin = build_panel(panel)
     logging.info(
         "Loaded %s countries, %s components, origin %s",
         len(EXPECTED_GEOS),
@@ -591,7 +611,7 @@ def main(
         origin.date(),
     )
 
-    baselines, multipliers = build_artifacts(wide, yoy, origin)
+    baselines, multipliers = build_artifacts(wide, yoy, dy, origin)
     history = build_history(wide, origin)
     validate_artifacts(baselines, multipliers, history)
 
