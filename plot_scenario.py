@@ -1,4 +1,4 @@
-"""Plot historical HICP indices and a joint-fit shock scenario for one country."""
+"""Plot historical HICP indices and a simultaneous two-shock scenario."""
 
 import argparse
 from pathlib import Path
@@ -17,8 +17,8 @@ BASELINE_FILE = "baselines.csv"
 MULTIPLIER_FILE = "multipliers.csv"
 HISTORY_FILE = "historical_indices.csv"
 DEFAULT_COUNTRY = "FR"
-DEFAULT_SHOCK = "CP045"
 DEFAULT_SHOCK_SIZE = 0.10
+SHOCK_COICOPS = ("CP045", "CP0722")
 COLORS = {
     "history": "#1f4e79",
     "baseline": "#e67e22",
@@ -46,16 +46,15 @@ def make_plot(
     multipliers: pd.DataFrame,
     history: pd.DataFrame,
     country: str,
-    shock_coicop: str,
     shock_size: float,
     output: Path,
 ) -> Path:
-    """Render a multi-panel historical, baseline, and scenario chart."""
+    """Render historical, conditional-baseline, and two-shock scenario panels."""
     country_baselines = baselines[baselines["country"] == country]
     country_history = history[history["country"] == country]
     country_multipliers = multipliers[
         (multipliers["country"] == country)
-        & (multipliers["shock_variable"] == shock_coicop)
+        & (multipliers["shock_variable"].isin(SHOCK_COICOPS))
     ]
 
     if country_baselines.empty:
@@ -64,22 +63,39 @@ def make_plot(
         raise ValueError(f"No historical indices found for {country}")
     if country_baselines["target_period"].nunique() != 1:
         raise ValueError(f"Multiple target periods found for {country}")
-    if country_multipliers.duplicated("target_coicop").any():
-        raise ValueError(f"Duplicate multipliers for {country}/{shock_coicop}")
+    if country_multipliers.duplicated(
+        ["target_coicop", "shock_variable"]
+    ).any():
+        raise ValueError(f"Duplicate multipliers for {country}")
 
     target_period = country_baselines["target_period"].iloc[0]
     baseline_map = country_baselines.set_index("coicop")["baseline_index_t3"]
-    beta_map = country_multipliers.set_index("target_coicop")["beta_multiplier"]
+    beta_table = country_multipliers.pivot(
+        index="target_coicop",
+        columns="shock_variable",
+        values="beta_multiplier",
+    )
+    if set(beta_table.columns) != set(SHOCK_COICOPS):
+        raise ValueError(
+            f"Missing shock multipliers for {country}: {sorted(beta_table.columns)}"
+        )
+
+    expected_targets = set(baseline_map.index) - set(SHOCK_COICOPS)
+    if set(beta_table.index) != expected_targets:
+        raise ValueError(f"Unexpected multiplier targets for {country}")
 
     history_pivot = country_history.pivot(
         index="date",
         columns="coicop",
         values="index_value",
     ).sort_index()
-    components = [shock_coicop] + [
-        component
-        for component in sorted(baseline_map.index)
-        if component != shock_coicop
+    components = [
+        *[component for component in SHOCK_COICOPS if component in baseline_map.index],
+        *[
+            component
+            for component in sorted(baseline_map.index)
+            if component not in SHOCK_COICOPS
+        ],
     ]
 
     missing_history = set(components) - set(history_pivot.columns)
@@ -120,10 +136,15 @@ def make_plot(
             zorder=4,
         )
 
-        beta = beta_map.get(component)
-        if pd.notna(beta):
-            scenario_index = baseline_index * np.exp(shock_size * float(beta))
-            scenario_change = 100.0 * np.expm1(shock_size * float(beta))
+        if component in beta_table.index:
+            betas = beta_table.loc[component]
+            delta_yoy = shock_size * float(
+                betas[SHOCK_COICOPS[0]] + betas[SHOCK_COICOPS[1]]
+            )
+            if not np.isfinite(delta_yoy):
+                raise ValueError(f"Invalid multipliers for {country}/{component}")
+            scenario_index = baseline_index * np.exp(delta_yoy)
+            scenario_change = 100.0 * np.expm1(delta_yoy)
             ax.scatter(
                 [target_period],
                 [scenario_index],
@@ -137,7 +158,7 @@ def make_plot(
             ax.text(
                 0.03,
                 0.06,
-                f"scenario vs baseline: {scenario_change:+.2f}%",
+                f"simultaneous scenario vs baseline: {scenario_change:+.2f}%",
                 transform=ax.transAxes,
                 fontsize=7.5,
                 color=COLORS["scenario"],
@@ -160,9 +181,13 @@ def make_plot(
         )
         ax.grid(alpha=0.22)
         ax.tick_params(labelsize=8)
-        title = f"{component} (shock source)" if component == shock_coicop else component
+        title = (
+            f"{component} (shock source)"
+            if component in SHOCK_COICOPS
+            else component
+        )
         ax.set_title(title, fontsize=10, fontweight="bold")
-        if component not in beta_map.index:
+        if component not in beta_table.index:
             ax.set_facecolor("#fafafa")
 
     for ax in axes[len(components):]:
@@ -200,7 +225,10 @@ def make_plot(
             marker="*",
             linestyle="None",
             markersize=11,
-            label=f"Scenario: {shock_coicop} +{shock_size:.0%}",
+            label=(
+                "Scenario: CP045 + CP0722 "
+                f"(+{shock_size:.2f} log pts each)"
+            ),
         ),
     ]
     fig.legend(
@@ -212,7 +240,7 @@ def make_plot(
         fontsize=10,
     )
     fig.suptitle(
-        f"{country}: {shock_coicop} joint-fit shock scenario across HICP components",
+        f"{country}: simultaneous CP045 + CP0722 shock across HICP components",
         fontsize=16,
         fontweight="bold",
         y=0.995,
@@ -220,8 +248,10 @@ def make_plot(
     fig.text(
         0.5,
         0.012,
-        "Baseline is conditional on realized CP045 and CP0722 for multiplier "
-        "targets; CP045 and CP0722 use AR-only baselines.",
+        "Both CP045 and CP0722 receive a "
+        f"+{shock_size:.2f} log-point shock at the origin. Baselines are "
+        "conditional on realized shocks for multiplier targets; CP045 and "
+        "CP0722 use AR-only baselines.",
         ha="center",
         fontsize=8,
         color="#555555",
@@ -250,15 +280,13 @@ def parse_args() -> argparse.Namespace:
         help="Target geography code, for example FR.",
     )
     parser.add_argument(
-        "--shock-coicop",
-        default=DEFAULT_SHOCK,
-        help="Shocked component, default CP045.",
-    )
-    parser.add_argument(
         "--shock-size",
         type=float,
         default=DEFAULT_SHOCK_SIZE,
-        help="Shock in log points; 0.10 means a 10 percent shock.",
+        help=(
+            "Shock in log points applied to both CP045 and CP0722; "
+            "0.10 means a 10 percent shock to each."
+        ),
     )
     parser.add_argument("--baselines", default=BASELINE_FILE)
     parser.add_argument("--multipliers", default=MULTIPLIER_FILE)
@@ -274,21 +302,20 @@ def main() -> None:
         raise ValueError("Shock size must be finite")
 
     country = args.country.upper()
-    shock_coicop = args.shock_coicop.upper()
     baselines, multipliers, history = load_artifacts(
         args.baselines,
         args.multipliers,
         args.history,
     )
     output = Path(
-        args.output or f"scenario_jointfit_{country}_{shock_coicop}.png"
+        args.output
+        or f"scenario_jointfit_{country}_CP045_CP0722.png"
     )
     path = make_plot(
         baselines,
         multipliers,
         history,
         country,
-        shock_coicop,
         args.shock_size,
         output,
     )
