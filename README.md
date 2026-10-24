@@ -5,6 +5,8 @@ an interactive energy-shock simulation dashboard.
 
 ## Dashboard
 
+Hosted live at [here](https://samueltaylor1010.github.io/hicp_forecast/).
+
 The dashboard is a Shiny Express app in `app/`. It has three panels:
 
 - left: graph geography, uniform vs country-specific shock scope, and a
